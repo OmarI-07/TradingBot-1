@@ -308,6 +308,49 @@ const HYPOTHESES = [
     },
   },
   {
+    id: 'h2e_sweep_trend_atr_wick_ny',
+    name: "H2e \u2014 H2d, New York session only",
+    description: "H2d\u2019s trend + ATR + wick gate, additionally restricted to the New York session (13:00\u201321:00 UTC) \u2014 the one session with a real sample size (48 trades) that looked best in H2d\u0027s Train run (+0.169R). Treated with the same suspicion as every prior session-narrowing attempt in this Lab (H5b, H7b, H3c\u0027s London), all of which looked promising on one Train run and failed on wide walk-forward. Train result here should not be trusted either way \u2014 only walk-forward on a wide month range answers whether this holds up.",
+    makeSignal: (candles) => {
+      const sma20 = calcSMASeries(candles, 20)
+      const ATR_THRESHOLD  = 22
+      const WICK_THRESHOLD = 0.25
+      let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
+      return (i) => {
+        const c = candles[i]
+        const d = dayKey(c.time)
+        if (d !== curDay) {
+          if (curDay !== null) { pdh = curHigh; pdl = curLow }
+          curDay = d; curHigh = c.high; curLow = c.low
+        } else {
+          curHigh = Math.max(curHigh, c.high)
+          curLow  = Math.min(curLow, c.low)
+        }
+        if (pdh == null || pdl == null) return 'none'
+        if (getSession(c.time) !== 'New York') return 'none'
+
+        let trendSteepness = 0
+        if (i >= 5 && sma20[i] != null && sma20[i - 5] != null && sma20[i - 5] !== 0) {
+          trendSteepness = (sma20[i] - sma20[i - 5]) / sma20[i - 5]
+        }
+        const atr   = calcATR(candles, i)
+        const range = c.high - c.low
+
+        if (c.low < pdl && c.close > pdl) {
+          const lowerWick = Math.min(c.open, c.close) - c.low
+          const wickRatio = range > 0 ? lowerWick / range : 0
+          if (trendSteepness > 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'buy'
+        }
+        if (c.high > pdh && c.close < pdh) {
+          const upperWick = c.high - Math.max(c.open, c.close)
+          const wickRatio = range > 0 ? upperWick / range : 0
+          if (trendSteepness < 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'sell'
+        }
+        return 'none'
+      }
+    },
+  },
+  {
     id: 'h3a_momentum_any',
     name: 'H3a — Momentum baseline (any time)',
     description: 'Simple 2-bar momentum entry, no time restriction. Baseline to compare H3b against — tests whether session alone changes the result.',
