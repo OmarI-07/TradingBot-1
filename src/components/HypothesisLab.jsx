@@ -266,6 +266,48 @@ const HYPOTHESES = [
     },
   },
   {
+    id: 'h2d_sweep_trend_atr_wick',
+    name: 'H2d — PDH/PDL Sweep, Trend + High ATR + Small Wick',
+    description: "H2c\u2019s trend-alignment gate, now also requiring ATR(14) \u2265 22pts and wick ratio \u2264 0.25 on the event candle \u2014 the exact combination the Event Context Explorer\u2019s joint breakdown showed as the widest split in the whole dataset: Uptrend/High ATR/Small Wick was +0.225R (n=202, CI clears zero positive) while Downtrend/High ATR/Small Wick was -0.360R (n=222, CI clears zero negative), same ATR and wick bucket, only trend direction differing. Thresholds are fixed, round numbers approximating the exploratory median split \u2014 not further tuned to this specific dataset. H2c alone already failed Train; this tests whether the narrower, ATR+wick-qualified version is what H2c\u2019s broader gate was diluting, or whether this is the one good-looking cell out of eight the joint table\u2019s own warning is about.",
+    makeSignal: (candles) => {
+      const sma20 = calcSMASeries(candles, 20)
+      const ATR_THRESHOLD  = 22
+      const WICK_THRESHOLD = 0.25
+      let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
+      return (i) => {
+        const c = candles[i]
+        const d = dayKey(c.time)
+        if (d !== curDay) {
+          if (curDay !== null) { pdh = curHigh; pdl = curLow }
+          curDay = d; curHigh = c.high; curLow = c.low
+        } else {
+          curHigh = Math.max(curHigh, c.high)
+          curLow  = Math.min(curLow, c.low)
+        }
+        if (pdh == null || pdl == null) return 'none'
+
+        let trendSteepness = 0
+        if (i >= 5 && sma20[i] != null && sma20[i - 5] != null && sma20[i - 5] !== 0) {
+          trendSteepness = (sma20[i] - sma20[i - 5]) / sma20[i - 5]
+        }
+        const atr   = calcATR(candles, i)
+        const range = c.high - c.low
+
+        if (c.low < pdl && c.close > pdl) {
+          const lowerWick = Math.min(c.open, c.close) - c.low
+          const wickRatio = range > 0 ? lowerWick / range : 0
+          if (trendSteepness > 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'buy'
+        }
+        if (c.high > pdh && c.close < pdh) {
+          const upperWick = c.high - Math.max(c.open, c.close)
+          const wickRatio = range > 0 ? upperWick / range : 0
+          if (trendSteepness < 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'sell'
+        }
+        return 'none'
+      }
+    },
+  },
+  {
     id: 'h3a_momentum_any',
     name: 'H3a — Momentum baseline (any time)',
     description: 'Simple 2-bar momentum entry, no time restriction. Baseline to compare H3b against — tests whether session alone changes the result.',
