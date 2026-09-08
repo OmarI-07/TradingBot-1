@@ -636,7 +636,7 @@ function quantileBuckets(items, valueKey, k = 5) {
   })
   return bucketed.map((bucket) => {
     const n = bucket.length
-    if (n === 0) return { n: 0, meanR: 0, ci95: 0, lower: 0, upper: 0, totalDollar: 0, featureRange: [0, 0] }
+    if (n === 0) return { n: 0, meanR: 0, ci95: 0, lower: 0, upper: 0, totalDollar: 0, featureRange: [0, 0], winRate: 0, winRateLower: 0, winRateUpper: 0 }
     const rMults    = bucket.map((b) => b.outcome.rMult)
     const mean      = rMults.reduce((a, b) => a + b, 0) / n
     const variance  = n > 1 ? rMults.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1) : 0
@@ -644,11 +644,16 @@ function quantileBuckets(items, valueKey, k = 5) {
     const ci95      = 1.96 * se
     const totalDollar = bucket.reduce((a, b) => a + b.outcome.dollarPnl, 0)
     const featureVals = bucket.map((b) => b[valueKey])
+    const wins     = bucket.filter((b) => b.outcome.dollarPnl > 0).length
+    const wilson   = wilsonInterval(wins, n)
     return {
       n, meanR: +mean.toFixed(3), ci95: +ci95.toFixed(3),
       lower: +(mean - ci95).toFixed(3), upper: +(mean + ci95).toFixed(3),
       totalDollar: +totalDollar.toFixed(0),
       featureRange: [+Math.min(...featureVals).toFixed(4), +Math.max(...featureVals).toFixed(4)],
+      winRate: +((wins / n) * 100).toFixed(1),
+      winRateLower: +(wilson.lower * 100).toFixed(1),
+      winRateUpper: +(wilson.upper * 100).toFixed(1),
     }
   })
 }
@@ -694,14 +699,109 @@ function jointBuckets(items) {
     const se       = Math.sqrt(variance / n)
     const ci95     = 1.96 * se
     const totalDollar = bucket.reduce((a, b) => a + b.outcome.dollarPnl, 0)
+    const wins     = bucket.filter((b) => b.outcome.dollarPnl > 0).length
+    const wilson   = wilsonInterval(wins, n)
     return {
       label, n, meanR: +mean.toFixed(3), ci95: +ci95.toFixed(3),
       lower: +(mean - ci95).toFixed(3), upper: +(mean + ci95).toFixed(3),
       totalDollar: +totalDollar.toFixed(0),
+      winRate: +((wins / n) * 100).toFixed(1),
+      winRateLower: +(wilson.lower * 100).toFixed(1),
+      winRateUpper: +(wilson.upper * 100).toFixed(1),
     }
   })
   results.sort((a, b) => b.meanR - a.meanR)
   return results
+}
+
+// ── Monte Carlo permutation test ──────────────────────────────────
+// Answers a different, more fundamental question than walk-forward does:
+// not "did this hold up on unseen months" but "is this result even
+// distinguishable from what a worthless rule could produce by chance on
+// data with the same overall statistical shape." Preserves the price
+// series' mean, stdev, skew, kurtosis, and overall drift (the exact first
+// open and last close are mathematically guaranteed to match \u2014 shuffling
+// a set of numbers never changes their sum) while destroying the actual
+// sequential pattern \u2014 the trends, the specific highs/lows a sweep or
+// ATR calculation depends on. If the real hypothesis's result isn't
+// meaningfully better than what it produces on most of these permutations,
+// the rule isn't capturing real sequential structure \u2014 whatever number
+// it produced on real data is closer to noise than edge.
+function permuteBars(candles, startIndex = 0) {
+  const n = candles.length
+  if (startIndex >= n - 2) return candles
+
+  const relValues = []
+  const gaps = []
+  for (let i = startIndex + 1; i < n; i++) {
+    const c = candles[i]
+    const prevClose = candles[i - 1].close
+    const logOpen = Math.log(c.open)
+    relValues.push({
+      relHigh: Math.log(c.high) - logOpen,
+      relLow: Math.log(c.low) - logOpen,
+      relClose: Math.log(c.close) - logOpen,
+    })
+    gaps.push(logOpen - Math.log(prevClose))
+  }
+
+  function shuffle(arr) {
+    const out = [...arr]
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      const tmp = out[i]; out[i] = out[j]; out[j] = tmp
+    }
+    return out
+  }
+
+  const shuffledRel  = shuffle(relValues)
+  const shuffledGaps = shuffle(gaps)
+
+  const out = new Array(n)
+  for (let i = 0; i <= startIndex; i++) out[i] = { ...candles[i] }
+
+  let prevClose = candles[startIndex].close
+  for (let k = 0; k < shuffledRel.length; k++) {
+    const i = startIndex + 1 + k
+    const logOpen = Math.log(prevClose) + shuffledGaps[k]
+    const open  = Math.exp(logOpen)
+    const high  = Math.exp(logOpen + shuffledRel[k].relHigh)
+    const low   = Math.exp(logOpen + shuffledRel[k].relLow)
+    const close = Math.exp(logOpen + shuffledRel[k].relClose)
+    out[i] = { time: candles[i].time, open, high, low, close }
+    prevClose = close
+  }
+  return out
+}
+
+function runPermutationTest(candles, hypothesis, numPermutations = 200) {
+  const realFn = hypothesis.makeSignal(candles)
+  const realTrades = runEngine(candles, realFn).trades
+  const realStats = summarize(realTrades)
+  const realMetric = realStats.expectancyR
+
+  let asGoodOrBetter = 0
+  const permMetrics = []
+  for (let p = 0; p < numPermutations; p++) {
+    const permuted = permuteBars(candles, 0)
+    const fn = hypothesis.makeSignal(permuted)
+    const trades = runEngine(permuted, fn).trades
+    const stats = summarize(trades)
+    permMetrics.push(stats.expectancyR)
+    if (stats.expectancyR >= realMetric) asGoodOrBetter++
+  }
+
+  permMetrics.sort((a, b) => a - b)
+  const pValue = asGoodOrBetter / numPermutations
+  const median = permMetrics[Math.floor(permMetrics.length / 2)]
+  const p25 = permMetrics[Math.floor(permMetrics.length * 0.25)]
+  const p75 = permMetrics[Math.floor(permMetrics.length * 0.75)]
+
+  return {
+    realMetric, realStats, pValue, numPermutations,
+    permMin: permMetrics[0], permP25: p25, permMedian: median,
+    permP75: p75, permMax: permMetrics[permMetrics.length - 1],
+  }
 }
 
 function runContextExplorer(candles) {
@@ -815,7 +915,7 @@ function runEngine(candles, signalFn) {
 }
 
 function summarize(trades) {
-  if (!trades.length) return { trades: 0, winRate: 0, expectancyR: 0, totalDollar: 0, maxDD: 0, totalCommission: 0 }
+  if (!trades.length) return { trades: 0, winRate: 0, expectancyR: 0, totalDollar: 0, maxDD: 0, totalCommission: 0, winRateLower: 0, winRateUpper: 0 }
   const wins = trades.filter((t) => t.dollarPnl > 0)
   const expectancyR = trades.reduce((s, t) => s + t.rMult, 0) / trades.length
   const totalDollar = trades.reduce((s, t) => s + t.dollarPnl, 0)
@@ -826,9 +926,12 @@ function summarize(trades) {
     peak = Math.max(peak, equity)
     maxDD = Math.max(maxDD, peak - equity)
   }
+  const wilson = wilsonInterval(wins.length, trades.length)
   return {
     trades: trades.length,
     winRate: +((wins.length / trades.length) * 100).toFixed(1),
+    winRateLower: +(wilson.lower * 100).toFixed(1),
+    winRateUpper: +(wilson.upper * 100).toFixed(1),
     expectancyR: +expectancyR.toFixed(3),
     totalDollar: +totalDollar.toFixed(0),
     maxDD: +maxDD.toFixed(0),
@@ -838,6 +941,20 @@ function summarize(trades) {
 
 function passesBar(stats) {
   return stats.trades >= PASS_BAR.minTrades && stats.expectancyR >= PASS_BAR.minExpectancyR
+}
+
+// A raw win-rate percentage means very little on its own at small sample
+// sizes \u2014 a normal-approximation interval badly understates uncertainty
+// when n is small. The Wilson score interval corrects for this. On n=11
+// (H2c\u0027s Asian-session \u2605, 54.5% win rate), the true 95% interval is
+// roughly [28%, 79%] \u2014 not the tight band the raw number implies.
+function wilsonInterval(wins, n, z = 1.96) {
+  if (n === 0) return { lower: 0, upper: 0, center: 0 }
+  const p = wins / n
+  const denom  = 1 + (z * z) / n
+  const center = (p + (z * z) / (2 * n)) / denom
+  const margin = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / denom
+  return { lower: Math.max(0, center - margin), upper: Math.min(1, center + margin), center }
 }
 
 // ── Raw trade export ──────────────────────────────────────────────
@@ -930,7 +1047,10 @@ function StatRow({ label, stats, isPass }) {
     <tr>
       <td style={{ padding: '6px 8px' }}>{label}</td>
       <td style={{ padding: '6px 8px', textAlign: 'right' }}>{stats.trades}</td>
-      <td style={{ padding: '6px 8px', textAlign: 'right' }}>{stats.winRate}%</td>
+      <td style={{ padding: '6px 8px', textAlign: 'right' }}>
+        {stats.winRate}%
+        <span style={{ color: 'var(--text-dim)', fontSize: 10 }}> [{stats.winRateLower}\u2013{stats.winRateUpper}]</span>
+      </td>
       <td style={{ padding: '6px 8px', textAlign: 'right' }}>{stats.expectancyR >= 0 ? '+' : ''}{stats.expectancyR}R</td>
       <td style={{ padding: '6px 8px', textAlign: 'right', color: pnlColor }}>
         {stats.totalDollar >= 0 ? '+' : ''}${stats.totalDollar}
@@ -1018,6 +1138,7 @@ function FeatureBucketTable({ title, buckets, unit }) {
           <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
             <th style={{ textAlign: 'left', padding: '3px 6px' }}>Quintile (low\u2192high)</th>
             <th style={{ padding: '3px 6px' }}>n</th>
+            <th style={{ padding: '3px 6px' }}>Win% [Wilson]</th>
             <th style={{ padding: '3px 6px' }}>Mean R</th>
             <th style={{ padding: '3px 6px' }}>95% CI</th>
             <th style={{ padding: '3px 6px' }}>P&amp;L</th>
@@ -1030,6 +1151,9 @@ function FeatureBucketTable({ title, buckets, unit }) {
               <tr key={i}>
                 <td style={{ padding: '3px 6px' }}>Q{i + 1} ({b.featureRange[0]}{unit}\u2013{b.featureRange[1]}{unit})</td>
                 <td style={{ padding: '3px 6px', textAlign: 'right' }}>{b.n}</td>
+                <td style={{ padding: '3px 6px', textAlign: 'right' }}>
+                  {b.winRate}% <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>[{b.winRateLower}\u2013{b.winRateUpper}]</span>
+                </td>
                 <td style={{ padding: '3px 6px', textAlign: 'right' }}>{b.meanR >= 0 ? '+' : ''}{b.meanR}R</td>
                 <td style={{ padding: '3px 6px', textAlign: 'right', color: ciCrossesZero ? 'var(--text-dim)' : (b.lower > 0 ? 'var(--green)' : 'var(--red)') }}>
                   [{b.lower}, {b.upper}]
@@ -1062,6 +1186,7 @@ function JointBucketTable({ buckets }) {
           <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
             <th style={{ textAlign: 'left', padding: '3px 6px' }}>Combination</th>
             <th style={{ padding: '3px 6px' }}>n</th>
+            <th style={{ padding: '3px 6px' }}>Win% [Wilson]</th>
             <th style={{ padding: '3px 6px' }}>Mean R</th>
             <th style={{ padding: '3px 6px' }}>95% CI</th>
             <th style={{ padding: '3px 6px' }}>P&amp;L</th>
@@ -1074,6 +1199,9 @@ function JointBucketTable({ buckets }) {
               <tr key={i}>
                 <td style={{ padding: '3px 6px' }}>{b.label}</td>
                 <td style={{ padding: '3px 6px', textAlign: 'right' }}>{b.n}</td>
+                <td style={{ padding: '3px 6px', textAlign: 'right' }}>
+                  {b.winRate}% <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>[{b.winRateLower}\u2013{b.winRateUpper}]</span>
+                </td>
                 <td style={{ padding: '3px 6px', textAlign: 'right' }}>{b.meanR >= 0 ? '+' : ''}{b.meanR}R</td>
                 <td style={{ padding: '3px 6px', textAlign: 'right', color: ciCrossesZero ? 'var(--text-dim)' : (b.lower > 0 ? 'var(--green)' : 'var(--red)') }}>
                   [{b.lower}, {b.upper}]
@@ -1128,6 +1256,13 @@ export default function HypothesisLab() {
   const [ceLoadMsg, setCeLoadMsg]   = useState('')
   const [ceError, setCeError]       = useState('')
   const [ceResults, setCeResults]   = useState(null) // { totalEvents, resolvedEvents, byRecentRange, byWickSize, byTrendSteepness }
+
+  const [ptHypId, setPtHypId]       = useState(HYPOTHESES[0].id)
+  const [ptMonths, setPtMonths]     = useState([])
+  const [ptRunning, setPtRunning]   = useState(false)
+  const [ptLoadMsg, setPtLoadMsg]   = useState('')
+  const [ptError, setPtError]       = useState('')
+  const [ptResults, setPtResults]   = useState(null)
 
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
@@ -1272,6 +1407,29 @@ export default function HypothesisLab() {
     } finally {
       setCeRunning(false)
       setCeLoadMsg('')
+    }
+  }
+
+  async function runPermutationTestUI() {
+    if (!ptMonths.length) { setPtError('Select at least one month.'); return }
+    setPtError('')
+    setPtRunning(true)
+    setPtResults(null)
+    try {
+      setPtLoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(SYMBOL, '5min', [...ptMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      const hyp = HYPOTHESES.find((h) => h.id === ptHypId)
+      setPtLoadMsg('Running 200 permutations\u2026 this takes a while')
+      // yield one tick so the loading message actually paints before the
+      // synchronous permutation loop blocks the thread
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      const result = runPermutationTest(candles, hyp, 200)
+      setPtResults(result)
+    } catch (e) {
+      setPtError(e.message)
+    } finally {
+      setPtRunning(false)
+      setPtLoadMsg('')
     }
   }
 
@@ -1476,6 +1634,78 @@ export default function HypothesisLab() {
           <FeatureBucketTable title="By wick size (fraction of candle range)" buckets={ceResults.byWickSize} unit="" />
           <FeatureBucketTable title="By trend steepness (5-bar % change of 20-SMA)" buckets={ceResults.byTrendSteepness} unit="" />
           <JointBucketTable buckets={ceResults.joint} />
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">4. Monte Carlo Permutation Test</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          A different question than walk-forward: not "did this hold up on unseen months" but "is this
+          result even distinguishable from what a worthless rule could produce by chance." Generates 200
+          price-series permutations \u2014 same overall drift, mean, stdev, skew, and kurtosis as the real
+          data, but the actual sequential pattern (trends, the specific highs/lows an event depends on) is
+          destroyed \u2014 and runs the selected hypothesis on each one, unchanged. If the real expectancy
+          isn\u2019t clearly better than most of the permutations, the rule isn\u2019t capturing real
+          structure. This can take a while to run \u2014 it re-runs the full engine 200 times.
+        </p>
+      </div>
+
+      <div className="card">
+        <div className="row" style={{ marginBottom: 8 }}>
+          <label className="lbl" style={{ margin: 0 }}>Hypothesis to test</label>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {HYPOTHESES.map((h) => (
+            <button
+              key={h.id}
+              onClick={() => setPtHypId(h.id)}
+              style={{
+                padding: '6px 10px', borderRadius: 6,
+                border: `1px solid ${ptHypId === h.id ? 'var(--blue)' : 'var(--border)'}`,
+                background: ptHypId === h.id ? 'rgba(45,108,223,0.15)' : 'var(--surface)',
+                color: ptHypId === h.id ? 'var(--blue)' : 'var(--text-muted)',
+                fontSize: 11, fontWeight: ptHypId === h.id ? 600 : 400, cursor: 'pointer',
+              }}
+            >
+              {h.id}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <MonthPicker label="Permutation test months" selected={ptMonths} onToggle={toggle(setPtMonths)} />
+
+      {ptError && <div className="error-box">{ptError}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runPermutationTestUI} disabled={ptRunning} style={{ flex: 1, padding: '11px' }}>
+          {ptRunning ? `\u23f3 ${ptLoadMsg}` : '\u25b6 Run permutation test'}
+        </button>
+      </div>
+
+      {ptResults && (
+        <div className="card">
+          <div className="card-title">{ptHypId}</div>
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            Real expectancy: <strong>{ptResults.realMetric >= 0 ? '+' : ''}{ptResults.realMetric.toFixed(3)}R</strong>
+            {' '}({ptResults.realStats.trades} trades, {ptResults.realStats.winRate}% win rate)
+          </p>
+          <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+            color: ptResults.pValue <= 0.01 ? 'var(--green)' : ptResults.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+            p = {(ptResults.pValue * 100).toFixed(1)}%
+          </p>
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+            {(ptResults.pValue * 100).toFixed(1)}% of {ptResults.numPermutations} permutations matched or beat the
+            real result. {ptResults.pValue <= 0.01
+              ? 'Under 1% — the real result clears the video\u2019s stated bar for a pass.'
+              : ptResults.pValue <= 0.05
+              ? 'Under 5% but above 1% — worth more scrutiny, not a clean pass.'
+              : 'Above 5% — a worthless rule could plausibly have produced this result by chance. Treat the real number as unreliable.'}
+          </p>
+          <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+            Permutation expectancy distribution: min {ptResults.permMin.toFixed(3)}R, 25th {ptResults.permP25.toFixed(3)}R,
+            median {ptResults.permMedian.toFixed(3)}R, 75th {ptResults.permP75.toFixed(3)}R, max {ptResults.permMax.toFixed(3)}R
+          </div>
         </div>
       )}
     </div>
