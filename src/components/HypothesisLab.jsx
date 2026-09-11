@@ -824,6 +824,64 @@ function runContextExplorer(candles) {
   }
 }
 
+// ── Gap magnitude on Opening Range Breakout ───────────────────────
+// A second, separate contextual-feature study \u2014 not another cut of the
+// PDH/PDL sweep event, a different event entirely (same one H1 already
+// uses). One of the few genuinely clean, monotonic findings from outside
+// research: |today's open \u2212 yesterday's close| normalized by ATR,
+// tested against ORB outcome. The reported result on ES was a clean
+// climb in win rate across quintiles (42%\u219244%\u219250%\u219252%\u219251%),
+// p=0.000012 \u2014 worth checking whether the same pattern shows up here.
+
+function detectORBEvents(candles) {
+  const events = []
+  let day = null, rangeHigh = -Infinity, rangeLow = Infinity, fired = false
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i]
+    const d = dayKey(c.time)
+    if (d !== day) { day = d; rangeHigh = -Infinity; rangeLow = Infinity; fired = false }
+    const h = utcHour(c.time), m = utcMinute(c.time)
+    if (h === 13 && m < 30) {
+      rangeHigh = Math.max(rangeHigh, c.high)
+      rangeLow  = Math.min(rangeLow, c.low)
+      continue
+    }
+    if (fired || rangeHigh === -Infinity) continue
+    if (c.close > rangeHigh) { events.push({ idx: i, direction: 'bullish' }); fired = true }
+    else if (c.close < rangeLow) { events.push({ idx: i, direction: 'bearish' }); fired = true }
+  }
+  return events
+}
+
+function gapMagnitudeFeature(candles, eventIdx) {
+  const eventDay = dayKey(candles[eventIdx].time)
+  let todayOpenIdx = eventIdx
+  while (todayOpenIdx > 0 && dayKey(candles[todayOpenIdx - 1].time) === eventDay) todayOpenIdx--
+  if (todayOpenIdx === 0) return null
+  const todayOpen = candles[todayOpenIdx].open
+  const yesterdayClose = candles[todayOpenIdx - 1].close
+  const atr = calcATR(candles, eventIdx)
+  if (atr <= 0) return null
+  return Math.abs(todayOpen - yesterdayClose) / atr
+}
+
+function runGapAnalysis(candles) {
+  const events = detectORBEvents(candles)
+  const withOutcomes = []
+  for (const ev of events) {
+    const outcome = simulateEventOutcome(candles, ev.idx, ev.direction)
+    if (!outcome) continue
+    const gapMagnitude = gapMagnitudeFeature(candles, ev.idx)
+    if (gapMagnitude == null) continue
+    withOutcomes.push({ gapMagnitude, outcome })
+  }
+  return {
+    totalEvents: events.length,
+    resolvedEvents: withOutcomes.length,
+    byGapMagnitude: quantileBuckets(withOutcomes, 'gapMagnitude'),
+  }
+}
+
 // ── Minimal engine — fresh, not shared with backtest.js ─────────────
 // Every fill below goes through slip() and every closed trade pays
 // commission on both sides. Returns the raw trade list (used for
@@ -1257,6 +1315,12 @@ export default function HypothesisLab() {
   const [ceError, setCeError]       = useState('')
   const [ceResults, setCeResults]   = useState(null) // { totalEvents, resolvedEvents, byRecentRange, byWickSize, byTrendSteepness }
 
+  const [gaMonths, setGaMonths]     = useState([])
+  const [gaRunning, setGaRunning]   = useState(false)
+  const [gaLoadMsg, setGaLoadMsg]   = useState('')
+  const [gaError, setGaError]       = useState('')
+  const [gaResults, setGaResults]   = useState(null) // { totalEvents, resolvedEvents, byGapMagnitude }
+
   const [ptHypId, setPtHypId]       = useState(HYPOTHESES[0].id)
   const [ptMonths, setPtMonths]     = useState([])
   const [ptRunning, setPtRunning]   = useState(false)
@@ -1407,6 +1471,25 @@ export default function HypothesisLab() {
     } finally {
       setCeRunning(false)
       setCeLoadMsg('')
+    }
+  }
+
+  async function runGapAnalysisUI() {
+    if (!gaMonths.length) { setGaError('Select at least one month.'); return }
+    setGaError('')
+    setGaRunning(true)
+    setGaResults(null)
+    try {
+      setGaLoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(SYMBOL, '5min', [...gaMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      setGaLoadMsg('Detecting ORB events and computing gap magnitude\u2026')
+      const result = runGapAnalysis(candles)
+      setGaResults(result)
+    } catch (e) {
+      setGaError(e.message)
+    } finally {
+      setGaRunning(false)
+      setGaLoadMsg('')
     }
   }
 
@@ -1634,6 +1717,36 @@ export default function HypothesisLab() {
           <FeatureBucketTable title="By wick size (fraction of candle range)" buckets={ceResults.byWickSize} unit="" />
           <FeatureBucketTable title="By trend steepness (5-bar % change of 20-SMA)" buckets={ceResults.byTrendSteepness} unit="" />
           <JointBucketTable buckets={ceResults.joint} />
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">3b. Gap Magnitude on Opening Range Breakout</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          A different event (H1\u2019s opening range breakout, not the PDH/PDL sweep) and a different
+          feature: |today\u2019s open \u2212 yesterday\u2019s close| / ATR. Outside research found a clean,
+          monotonic win-rate climb across quintiles with this exact feature on this exact event \u2014 worth
+          checking directly rather than assuming it transfers.
+        </p>
+      </div>
+
+      <MonthPicker label="Gap analysis months" selected={gaMonths} onToggle={toggle(setGaMonths)} />
+
+      {gaError && <div className="error-box">{gaError}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runGapAnalysisUI} disabled={gaRunning} style={{ flex: 1, padding: '11px' }}>
+          {gaRunning ? `\u23f3 ${gaLoadMsg}` : '\u25b6 Run gap analysis'}
+        </button>
+      </div>
+
+      {gaResults && (
+        <div className="card">
+          <div className="card-title">Opening Range Breakout \u2014 Gap Magnitude Breakdown</div>
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 12 }}>
+            {gaResults.totalEvents} ORB events detected, {gaResults.resolvedEvents} resolved with a usable prior-day gap.
+          </p>
+          <FeatureBucketTable title="By gap magnitude (|open \u2212 prior close| / ATR)" buckets={gaResults.byGapMagnitude} unit="" />
         </div>
       )}
 
