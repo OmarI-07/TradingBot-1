@@ -1,0 +1,27 @@
+{
+  "execution": {
+    "pointValue": 2,
+    "tickSize": 0.25,
+    "riskDollars": 100,
+    "maxContracts": 6,
+    "commissionPerSide": 0.74,
+    "entrySlipTicks": 1,
+    "stopSlipTicks": 2,
+    "exitSlipTicks": 1,
+    "rthOnly": true
+  },
+  "search": {
+    "seed": 417,
+    "minDays": 120,
+    "minTrainTrades": 80,
+    "minValidationTrades": 40,
+    "minTestTrades": 40,
+    "minWinRate": 0.5,
+    "minExpectancyR": 0.03,
+    "minTradesPerDay": 0.5,
+    "minActiveDayFraction": 0.25,
+    "targetPatterns": 3,
+    "bootstrapReps": 2000,
+    "permutations": 0
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "base_repository": "https://github.com/OmarI-07/TradingBot-1",
+  "base_commit_prefix": "d271a22",
+  "changed_files": [
+    {
+      "path": ".gitignore",
+      "status": "added",
+      "sha256": "e314cddde2daec2b6072d82e34a0f9231c5b28bfbfb2778a5fc258f43507a9b5"
+    },
+    {
+      "path": "package.json",
+      "status": "modified",
+      "sha256": "395beed39755da5561a66a06ee328bde53a68aaf1972af868d9d17a333dc0a72"
+    },
+    {
+      "path": "RESEARCH.md",
+      "status": "added",
+      "sha256": "e66565c996d7b3ea60bfce53d192d271c81bc7f40041204f327ce484df012f04"
+    },
+    {
+      "path": "research/.gitignore",
+      "status": "added",
+      "sha256": "94e65ac2c3bdc52c5ce4d7eafe8aef9a0c68dd35a4f2eacc72ac452acb20bee9"
+    },
+    {
+      "path": "research/config.json",
+      "status": "added",
+      "sha256": "a330627bf741418537f811be7ba2e86132fb44c07240e528268c6b759eb2e899"
+    },
+    {
+      "path": "research/run.mjs",
+      "status": "added",
+      "sha256": "c800e147af8cccdbe47ee1107aef149b54b17a41ac3c0571e5c1fad2543b9dec"
+    },
+    {
+      "path": "research/watch.mjs",
+      "status": "added",
+      "sha256": "867fb252a1c80f7e8986b5efe8d7617d170f95c289a3f642d0ff57da03aee7ad"
+    },
+    {
+      "path": "research/tests/engine.test.mjs",
+      "status": "added",
+      "sha256": "7091a0ea2da7f969624c58ec6366586e3836883a7423c739e6b659707b5e9d22"
+    },
+    {
+      "path": "src/components/HypothesisLab.jsx",
+      "status": "modified",
+      "sha256": "589af9a22a9a401e874295bd5f106f0c121d5ae36a61902537e412869b208bbe"
+    },
+    {
+      "path": "src/components/PatternResearch.jsx",
+      "status": "added",
+      "sha256": "8c5e88a096ac57ff275304dc1e707b43d02cc6ebb702f5fa9468f3243f220f6f"
+    },
+    {
+      "path": "src/research/data.js",
+      "status": "added",
+      "sha256": "cb49fe80be817b5e8750f3b42e14d21ed1a6b1efba104ea4a339527cf2290576"
+    },
+    {
+      "path": "src/research/engine.js",
+      "status": "added",
+      "sha256": "fc520c3556d487c25bb747e749c0ec712e269f4a8d45f8c7cc35b0ee635e380e"
+    },
+    {
+      "path": "src/research/hypotheses.js",
+      "status": "added",
+      "sha256": "6eb5555b7e11513ba73cca7eb80b1391b5b4d689030c4137a1cc0bd8be97b6b4"
+    },
+    {
+      "path": "src/research/research.worker.js",
+      "status": "added",
+      "sha256": "5dc5c920641b9e33e48b80a0707bd7b45f682dbf7123504ea4d117adeed6489e"
+    },
+    {
+      "path": "src/research/search.js",
+      "status": "added",
+      "sha256": "d373e59f316ae160313db651d117fb739ef8582f5a297ff22901898d6c4a3b23"
+    }
+  ],
+  "verification": {
+    "research_tests": 25,
+    "research_tests_passed": 25,
+    "legacy_hypotheses_exercised": 14,
+    "babel_source_files_compiled": 45,
+    "cli_resume_smoke": "passed",
+    "watch_restart_smoke": "passed",
+    "vite_build": "blocked: sandbox ancestor-directory access denied by esbuild; npm dependencies installed",
+    "real_nq_performance": "not run; no dataset supplied"
+  }
+}
