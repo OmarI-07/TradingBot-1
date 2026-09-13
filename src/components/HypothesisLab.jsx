@@ -254,6 +254,26 @@ const HYPOTHESES = [
     },
   },
   {
+    id: 'h8b_ma_cross_premarket_narrow',
+    name: "H8b \u2014 21-EMA Cross, 7\u201310:30am ET (corrected window)",
+    description: "Corrects a real translation error in H8: the source said entries happen 'premarket and a bit after opening bell,' separately from 'flat by 12pm EST' \u2014 two different claims (when to enter vs. how long to hold), which H8 incorrectly merged into one wide 7am\u201312pm entry window. This narrows entries to 7:00\u201310:30am ET (12:00\u201315:30 UTC, premarket through shortly after the 9:30am open) using the same 21-EMA cross and standard exit logic as H8. Treated as the final disciplined check on this source \u2014 MA period/type were never stated by the source at all and aren\u2019t worth further guessing given this whole category (H3a, H3b, H5) has already failed here.",
+    makeSignal: (candles) => {
+      const ema = calcEMASeries(candles, 21)
+      return (i) => {
+        if (i < 22) return 'none'
+        const h = utcHour(candles[i].time), m = utcMinute(candles[i].time)
+        const afterStart = h >= 12
+        const beforeEnd = h < 15 || (h === 15 && m === 0)
+        if (!(afterStart && beforeEnd)) return 'none'
+        if (ema[i] == null || ema[i - 1] == null) return 'none'
+        const prevClose = candles[i - 1].close, curClose = candles[i].close
+        if (prevClose <= ema[i - 1] && curClose > ema[i]) return 'buy'
+        if (prevClose >= ema[i - 1] && curClose < ema[i]) return 'sell'
+        return 'none'
+      }
+    },
+  },
+  {
     id: 'h2c_sweep_trend_aligned',
     name: 'H2c — PDH/PDL Sweep, Trend-Aligned',
     description: 'Identical event to H2, but only takes the trade when its direction agrees with the prevailing trend at that moment (5-bar % change of 20-SMA): bullish sweep only taken during an uptrend, bearish sweep only taken during a downtrend. Built from the Event Context Explorer\u0027s trend-steepness breakdown on H2\u0027s own event \u2014 steepest-downtrend quintile was significantly negative (CI cleared zero), steepest-uptrend quintile was the only positive mean in that table. Tests the direction-aware version of that finding, not a single arbitrary bucket.',
@@ -842,6 +862,253 @@ function runContextExplorer(candles) {
   }
 }
 
+// ── Generic PIP-clustering pattern miner ────────────────────────────
+// Different in kind from every hypothesis above. Nothing here starts from
+// a human-named feature (wick size, trend steepness, gap magnitude) \u2014 it
+// extracts the geometric SHAPE of every price window, groups similar
+// shapes via k-means (cluster count chosen automatically via silhouette
+// score, not guessed), and only afterward checks whether any shape-cluster
+// predicts anything. Deliberately generic on the input series \u2014
+// findPIPs/extractPatterns take any numeric array, not candles
+// specifically, so the exact same engine can run on volume, an
+// intermarket spread, or any other series once that data exists, with
+// zero new code.
+//
+// The permutation-tested validation step is the load-bearing part: picking
+// the single best-looking cluster out of several is about as aggressive a
+// multiple-comparisons search as exists \u2014 on pure noise, SOMETHING will
+// always look like the best cluster. This reuses the already-verified
+// permuteBars() to re-run the ENTIRE mining pipeline (not just re-test one
+// fixed rule) on scrambled data repeatedly, and compares the real best
+// cluster against what that same greedy search finds on fake data.
+
+function findPIPs(series, nPips) {
+  const n = series.length
+  if (n < 2) return []
+  let pipIndices = [0, n - 1]
+  while (pipIndices.length < nPips) {
+    let maxDist = -1, maxDistIdx = -1, insertPos = -1
+    for (let k = 0; k < pipIndices.length - 1; k++) {
+      const leftIdx = pipIndices[k], rightIdx = pipIndices[k + 1]
+      if (rightIdx - leftIdx < 2) continue
+      const x1 = leftIdx, y1 = series[leftIdx]
+      const x2 = rightIdx, y2 = series[rightIdx]
+      const dx = x2 - x1, dy = y2 - y1
+      const norm = Math.sqrt(dx * dx + dy * dy)
+      for (let idx = leftIdx + 1; idx < rightIdx; idx++) {
+        const x0 = idx, y0 = series[idx]
+        const dist = norm > 0 ? Math.abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / norm : Math.abs(y0 - y1)
+        if (dist > maxDist) { maxDist = dist; maxDistIdx = idx; insertPos = k + 1 }
+      }
+    }
+    if (maxDistIdx === -1) break
+    pipIndices.splice(insertPos, 0, maxDistIdx)
+  }
+  return pipIndices.sort((a, b) => a - b)
+}
+
+function extractPatterns(series, lookback, nPips, minGap) {
+  const patterns = []
+  let lastAcceptedEnd = -Infinity
+  for (let end = lookback; end < series.length; end++) {
+    if (end - lastAcceptedEnd < minGap) continue
+    const window = series.slice(end - lookback, end + 1)
+    const pipIdx = findPIPs(window, nPips)
+    if (pipIdx.length < nPips) continue
+    const pipVals = pipIdx.map((i) => window[i])
+    const mean = pipVals.reduce((a, b) => a + b, 0) / pipVals.length
+    const variance = pipVals.reduce((a, b) => a + (b - mean) ** 2, 0) / pipVals.length
+    const std = Math.sqrt(variance)
+    if (std === 0) continue
+    patterns.push({ endIdx: end, pattern: pipVals.map((v) => (v - mean) / std) })
+    lastAcceptedEnd = end
+  }
+  return patterns
+}
+
+function euclideanDist(a, b) {
+  let s = 0
+  for (let i = 0; i < a.length; i++) s += (a[i] - b[i]) ** 2
+  return Math.sqrt(s)
+}
+
+function kmeansPlusPlusInit(vectors, k) {
+  const centroids = [vectors[Math.floor(Math.random() * vectors.length)]]
+  while (centroids.length < k) {
+    const dists = vectors.map((v) => Math.min(...centroids.map((c) => euclideanDist(v, c) ** 2)))
+    const total = dists.reduce((a, b) => a + b, 0)
+    let r = Math.random() * total, idx = 0
+    for (; idx < dists.length; idx++) { r -= dists[idx]; if (r <= 0) break }
+    centroids.push(vectors[Math.min(idx, vectors.length - 1)])
+  }
+  return centroids
+}
+
+function kmeansCluster(vectors, k, maxIter = 50) {
+  let centroids = kmeansPlusPlusInit(vectors, k)
+  let assignments = new Array(vectors.length).fill(0)
+  for (let iter = 0; iter < maxIter; iter++) {
+    let changed = false
+    for (let i = 0; i < vectors.length; i++) {
+      let bestDist = Infinity, bestC = 0
+      for (let c = 0; c < k; c++) {
+        const d = euclideanDist(vectors[i], centroids[c])
+        if (d < bestDist) { bestDist = d; bestC = c }
+      }
+      if (assignments[i] !== bestC) changed = true
+      assignments[i] = bestC
+    }
+    const counts = new Array(k).fill(0)
+    const sums = Array.from({ length: k }, () => new Array(vectors[0].length).fill(0))
+    for (let i = 0; i < vectors.length; i++) {
+      const c = assignments[i]
+      counts[c]++
+      for (let d = 0; d < vectors[i].length; d++) sums[c][d] += vectors[i][d]
+    }
+    centroids = Array.from({ length: k }, (_, c) => (counts[c] === 0 ? centroids[c] : sums[c].map((s) => s / counts[c])))
+    if (!changed) break
+  }
+  return { assignments, centroids }
+}
+
+function silhouetteScore(vectors, assignments, k, sampleCap = 800) {
+  let sample = vectors.map((v, i) => ({ v, i, a: assignments[i] }))
+  if (sample.length > sampleCap) {
+    const sh = [...sample]
+    for (let i = sh.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1));[sh[i], sh[j]] = [sh[j], sh[i]] }
+    sample = sh.slice(0, sampleCap)
+  }
+  const n = sample.length
+  if (k < 2 || k >= n) return -1
+  let total = 0, counted = 0
+  for (let i = 0; i < n; i++) {
+    const ci = sample[i].a
+    let aSum = 0, aCount = 0
+    const bSums = new Array(k).fill(0), bCounts = new Array(k).fill(0)
+    for (let j = 0; j < n; j++) {
+      if (i === j) continue
+      const d = euclideanDist(sample[i].v, sample[j].v)
+      if (sample[j].a === ci) { aSum += d; aCount++ } else { bSums[sample[j].a] += d; bCounts[sample[j].a]++ }
+    }
+    if (aCount === 0) continue
+    const a = aSum / aCount
+    let b = Infinity
+    for (let c = 0; c < k; c++) { if (c === ci || bCounts[c] === 0) continue; b = Math.min(b, bSums[c] / bCounts[c]) }
+    if (!Number.isFinite(b)) continue
+    total += (b - a) / Math.max(a, b)
+    counted++
+  }
+  return counted > 0 ? total / counted : -1
+}
+
+function findBestK(vectors, kMin, kMax) {
+  let best = { k: kMin, score: -Infinity, assignments: null }
+  for (let k = kMin; k <= kMax; k++) {
+    const { assignments } = kmeansCluster(vectors, k)
+    const score = silhouetteScore(vectors, assignments, k)
+    if (score > best.score) best = { k, score, assignments }
+  }
+  return best
+}
+
+function evaluateCluster(outcomes) {
+  const n = outcomes.length
+  if (n === 0) return null
+  const rMults = outcomes.map((o) => o.rMult)
+  const mean = rMults.reduce((a, b) => a + b, 0) / n
+  const variance = n > 1 ? rMults.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1) : 0
+  const se = Math.sqrt(variance / n)
+  const ci95 = 1.96 * se
+  const totalDollar = outcomes.reduce((a, b) => a + b.dollarPnl, 0)
+  const wins = outcomes.filter((o) => o.dollarPnl > 0).length
+  const wilson = wilsonInterval(wins, n)
+  return {
+    n, expectancyR: +mean.toFixed(3), ci95: +ci95.toFixed(3),
+    lower: +(mean - ci95).toFixed(3), upper: +(mean + ci95).toFixed(3),
+    totalDollar: +totalDollar.toFixed(0),
+    winRate: +((wins / n) * 100).toFixed(1),
+    winRateLower: +(wilson.lower * 100).toFixed(1),
+    winRateUpper: +(wilson.upper * 100).toFixed(1),
+  }
+}
+
+// Direction is intrinsic to each cluster \u2014 determined from that cluster's
+// OWN average short-horizon forward move, not assumed. This is standard
+// for shape-based mining (there's no inherent "this shape means long" the
+// way a sweep event has an obvious direction) and is exactly why the
+// permutation test on the whole pipeline matters: this in-sample direction
+// call is part of what gets validated, not a separate assumption smuggled
+// in unchecked.
+function minePricePatterns(candles, opts = {}) {
+  const lookback = opts.lookback ?? 24
+  const nPips = opts.nPips ?? 5
+  const minGap = opts.minGap ?? 12
+  const kMin = opts.kMin ?? 3
+  const kMax = opts.kMax ?? 10
+  const forwardHorizon = opts.forwardHorizon ?? 10
+
+  const closes = candles.map((c) => c.close)
+  const patterns = extractPatterns(closes, lookback, nPips, minGap)
+  if (patterns.length < 50) return { error: 'Too few patterns extracted \u2014 need more months of data or a shorter lookback.' }
+
+  const vectors = patterns.map((p) => p.pattern)
+  const { k, score: silhouette, assignments } = findBestK(vectors, kMin, kMax)
+
+  const clusters = []
+  for (let c = 0; c < k; c++) {
+    const memberIdx = []
+    for (let i = 0; i < assignments.length; i++) if (assignments[i] === c) memberIdx.push(i)
+    if (memberIdx.length < 10) continue
+
+    const fwdReturns = []
+    for (const i of memberIdx) {
+      const endIdx = patterns[i].endIdx
+      if (endIdx + forwardHorizon >= candles.length) continue
+      fwdReturns.push(candles[endIdx + forwardHorizon].close - candles[endIdx].close)
+    }
+    if (fwdReturns.length < 10) continue
+    const avgFwd = fwdReturns.reduce((a, b) => a + b, 0) / fwdReturns.length
+    const direction = avgFwd >= 0 ? 'bullish' : 'bearish'
+
+    const outcomes = []
+    for (const i of memberIdx) {
+      const outcome = simulateEventOutcome(candles, patterns[i].endIdx, direction)
+      if (outcome) outcomes.push(outcome)
+    }
+    const evalResult = evaluateCluster(outcomes)
+    if (!evalResult) continue
+    clusters.push({ clusterId: c, direction, patternCount: memberIdx.length, ...evalResult })
+  }
+
+  clusters.sort((a, b) => b.expectancyR - a.expectancyR)
+  return { totalPatterns: patterns.length, k, silhouette: +silhouette.toFixed(3), clusters, best: clusters[0] || null }
+}
+
+function runMiningPermutationTest(candles, opts = {}, numPermutations = 20) {
+  const real = minePricePatterns(candles, opts)
+  if (real.error || !real.best) return { ...real, permutationSkipped: true }
+
+  const realBestR = real.best.expectancyR
+  let asGoodOrBetter = 0
+  const permBests = []
+  for (let p = 0; p < numPermutations; p++) {
+    const permuted = permuteBars(candles, 0)
+    const result = minePricePatterns(permuted, opts)
+    const bestR = (result.best && result.best.expectancyR) ?? -Infinity
+    permBests.push(bestR)
+    if (bestR >= realBestR) asGoodOrBetter++
+  }
+  permBests.sort((a, b) => a - b)
+  return {
+    ...real,
+    pValue: asGoodOrBetter / numPermutations,
+    numPermutations,
+    permMin: permBests[0],
+    permMedian: permBests[Math.floor(permBests.length / 2)],
+    permMax: permBests[permBests.length - 1],
+  }
+}
+
 // ── Gap magnitude on Opening Range Breakout ───────────────────────
 // A second, separate contextual-feature study \u2014 not another cut of the
 // PDH/PDL sweep event, a different event entirely (same one H1 already
@@ -1354,6 +1621,12 @@ export default function HypothesisLab() {
   const [scError, setScError]       = useState('')
   const [scResults, setScResults]   = useState(null) // { riskAdjusted, fixed6 }
 
+  const [pmMonths, setPmMonths]     = useState([])
+  const [pmRunning, setPmRunning]   = useState(false)
+  const [pmLoadMsg, setPmLoadMsg]   = useState('')
+  const [pmError, setPmError]       = useState('')
+  const [pmResults, setPmResults]   = useState(null)
+
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
   function toggle(setBucket) {
@@ -1539,6 +1812,26 @@ export default function HypothesisLab() {
     } finally {
       setPtRunning(false)
       setPtLoadMsg('')
+    }
+  }
+
+  async function runPatternMinerUI() {
+    if (!pmMonths.length) { setPmError('Select at least one month.'); return }
+    setPmError('')
+    setPmRunning(true)
+    setPmResults(null)
+    try {
+      setPmLoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(SYMBOL, '5min', [...pmMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      setPmLoadMsg('Extracting patterns, clustering, and running 20 permutations\u2026 this takes a while')
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      const result = runMiningPermutationTest(candles, {}, 20)
+      setPmResults(result)
+    } catch (e) {
+      setPmError(e.message)
+    } finally {
+      setPmRunning(false)
+      setPmLoadMsg('')
     }
   }
 
@@ -1951,6 +2244,95 @@ export default function HypothesisLab() {
                 </td>
                 <td style={{ padding: '4px 8px', textAlign: 'right' }}>-${scResults.fixed6.maxDD}</td>
               </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">6. Generic Pattern Miner (PIP + Clustering)</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          Genuinely different from every hypothesis above \u2014 nothing here starts from a human-named
+          feature. Extracts the geometric shape of every 24-bar close-price window (via perceptually
+          important points), groups similar shapes with k-means (cluster count chosen automatically via
+          silhouette score), and checks whether any resulting cluster predicts a real forward outcome using
+          this Lab\u2019s standard ATR stop/target and friction model. The whole pipeline \u2014 not just the
+          final picked cluster \u2014 gets re-run on 20 permuted (scrambled) versions of the same data,
+          because picking the single best of several clusters is an aggressive multiple-comparisons search:
+          on pure noise, something will always look like the best cluster. This can take 10\u201315 seconds.
+        </p>
+      </div>
+
+      <MonthPicker label="Pattern miner months" selected={pmMonths} onToggle={toggle(setPmMonths)} />
+
+      {pmError && <div className="error-box">{pmError}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runPatternMinerUI} disabled={pmRunning} style={{ flex: 1, padding: '11px' }}>
+          {pmRunning ? `\u23f3 ${pmLoadMsg}` : '\u25b6 Run pattern miner'}
+        </button>
+      </div>
+
+      {pmResults && pmResults.error && (
+        <div className="error-box">{pmResults.error}</div>
+      )}
+
+      {pmResults && !pmResults.error && (
+        <div className="card">
+          <div className="card-title">Mining Results</div>
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 10 }}>
+            {pmResults.totalPatterns} shape-patterns extracted \u2192 best cluster count k={pmResults.k}{' '}
+            (silhouette {pmResults.silhouette}) \u2192 {pmResults.clusters.length} clusters with enough
+            occurrences to evaluate.
+          </p>
+
+          {pmResults.pValue != null && (
+            <>
+              <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                color: pmResults.pValue <= 0.01 ? 'var(--green)' : pmResults.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                p = {(pmResults.pValue * 100).toFixed(1)}%
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+                {(pmResults.pValue * 100).toFixed(1)}% of {pmResults.numPermutations} full re-runs of this
+                entire mining pipeline on scrambled data matched or beat the real best cluster.{' '}
+                {pmResults.pValue <= 0.05
+                  ? 'Clears (or is close to) the bar \u2014 still needs the real cluster taken through Train/Validate/Test and walk-forward as its own hypothesis before trusting it further.'
+                  : 'Above 5% \u2014 the same greedy best-of-several-clusters search finds results this good on pure noise too often for the real one to be trustworthy.'}
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 12 }}>
+                Permutation best-cluster distribution: min {pmResults.permMin.toFixed(3)}R, median {pmResults.permMedian.toFixed(3)}R, max {pmResults.permMax.toFixed(3)}R
+              </p>
+            </>
+          )}
+
+          <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                <th style={{ textAlign: 'left', padding: '3px 6px' }}>Cluster</th>
+                <th style={{ padding: '3px 6px' }}>Dir</th>
+                <th style={{ padding: '3px 6px' }}>n</th>
+                <th style={{ padding: '3px 6px' }}>Win% [Wilson]</th>
+                <th style={{ padding: '3px 6px' }}>Expectancy</th>
+                <th style={{ padding: '3px 6px' }}>95% CI</th>
+                <th style={{ padding: '3px 6px' }}>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pmResults.clusters.map((c) => {
+                const ciCrossesZero = c.lower < 0 && c.upper > 0
+                const isBest = pmResults.best && c.clusterId === pmResults.best.clusterId
+                return (
+                  <tr key={c.clusterId} style={isBest ? { background: 'rgba(76,175,80,0.06)' } : undefined}>
+                    <td style={{ padding: '3px 6px' }}>#{c.clusterId}{isBest ? ' \u2605' : ''}</td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right' }}>{c.direction}</td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right' }}>{c.n}</td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right' }}>{c.winRate}% <span style={{ color: 'var(--text-dim)', fontSize: 9 }}>[{c.winRateLower}\u2013{c.winRateUpper}]</span></td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right' }}>{c.expectancyR >= 0 ? '+' : ''}{c.expectancyR}R</td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right', color: ciCrossesZero ? 'var(--text-dim)' : (c.lower > 0 ? 'var(--green)' : 'var(--red)') }}>[{c.lower}, {c.upper}]</td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right', color: c.totalDollar > 0 ? 'var(--green)' : c.totalDollar < 0 ? 'var(--red)' : 'var(--text-muted)' }}>{c.totalDollar >= 0 ? '+' : ''}${c.totalDollar}</td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
