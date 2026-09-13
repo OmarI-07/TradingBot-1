@@ -16,9 +16,9 @@
 //    same category of error as the look-ahead bias that inflated the
 //    original signal to a fake 68% win rate. See "Friction model" below.
 //  - Train / Validate / Test months are picked explicitly and separately —
-//    choosing months does not enforce historical research provenance.
+//    there is no way to accidentally run Test data early.
 //  - Rolling walk-forward runs every hypothesis on each month independently
-//    (fixed rules, nothing fit per-window) and stitches the evaluated
+//    (fixed rules, nothing fit per-window) and stitches the out-of-sample
 //    months into one equity curve — "worked in 2 of 8 months" is a much
 //    stronger answer than a single train/validate/test split.
 //  - Nothing here writes to Supabase, active_strategy, or paper_trades.
@@ -37,8 +37,6 @@
 // not a guess.
 
 import { useState } from 'react'
-import PatternResearch from './PatternResearch'
-import { simulate as simulateResearch, nyClock } from '../research/engine.js'
 import { fetchSelectedMonths, FUTURES_SYMBOLS, getAvailableMonths } from '../massiveFinance'
 
 // ── Fixed engine constants — same across every hypothesis, on purpose ──
@@ -194,15 +192,15 @@ const HYPOTHESES = [
   {
     id: 'h1_orb',
     name: 'H1 — Opening Range Breakout',
-    description: 'First 30 min of NY cash session (09:30–10:00 America/New_York) sets a range. Close beyond it → trade the breakout direction, once per day.',
+    description: 'First 30 min of NY session (13:00–13:30 UTC) sets a range. Close beyond it → trade the breakout direction, once per day.',
     makeSignal: (candles) => {
       let day = null, rangeHigh = -Infinity, rangeLow = Infinity, fired = false
       return (i) => {
         const c = candles[i]
         const d = dayKey(c.time)
         if (d !== day) { day = d; rangeHigh = -Infinity; rangeLow = Infinity; fired = false }
-        const { minute } = nyClock(c.time)
-        if (minute >= 570 && minute < 600) {
+        const h = utcHour(c.time), m = utcMinute(c.time)
+        if (h === 13 && m < 30) {
           rangeHigh = Math.max(rangeHigh, c.high)
           rangeLow  = Math.min(rangeLow, c.low)
           return 'none'
@@ -233,6 +231,24 @@ const HYPOTHESES = [
         if (pdh == null || pdl == null) return 'none'
         if (c.low  < pdl && c.close > pdl) return 'buy'
         if (c.high > pdh && c.close < pdh) return 'sell'
+        return 'none'
+      }
+    },
+  },
+  {
+    id: 'h8_ma_cross_session',
+    name: "H8 \u2014 21-EMA Cross, 7am\u201312pm ET",
+    description: "From an outside source (Reddit, unverified track record) describing a live prop-firm bot: price closes past a moving average on the 5-min chart, traded only 'premarket and a bit after opening bell' through 'flat by 12pm EST', NY/premarket only, never 24/7. Interpreted here as: price crosses (not just sits above/below) a 21-period EMA, gated to 7:00am\u201312:00pm ET (12:00\u201317:00 UTC, fixed EST offset matching this Lab\u0027s existing session convention). The window claim has independent support in this Lab\u0027s own data (session and time-of-day findings elsewhere favoring NY/late-morning); the entry rule itself closely resembles H3a/H5, both of which failed here \u2014 tested fresh, not trusted on the source\u0027s say-so.",
+    makeSignal: (candles) => {
+      const ema = calcEMASeries(candles, 21)
+      return (i) => {
+        if (i < 22) return 'none'
+        const h = utcHour(candles[i].time)
+        if (h < 12 || h >= 17) return 'none'
+        if (ema[i] == null || ema[i - 1] == null) return 'none'
+        const prevClose = candles[i - 1].close, curClose = candles[i].close
+        if (prevClose <= ema[i - 1] && curClose > ema[i]) return 'buy'
+        if (prevClose >= ema[i - 1] && curClose < ema[i]) return 'sell'
         return 'none'
       }
     },
@@ -592,14 +608,41 @@ function contextualFeatures(candles, sma20, idx, direction) {
 }
 
 function simulateEventOutcome(candles, eventIdx, direction) {
-  if (eventIdx + 1 >= candles.length) return null
-  const first = Math.max(0, eventIdx - 20)
-  const localIdx = eventIdx - first
-  const slice = candles.slice(first, Math.min(candles.length, eventIdx + MAX_HOLD_BARS + 2))
-  const result = simulateResearch(slice, i => i === localIdx ? (direction === 'bullish' ? 1 : -1) : 0,
-    legacyExecution(), { start: localIdx })
-  const trade = result.trades[0]
-  return trade ? { rMult: trade.rMult, dollarPnl: trade.dollarPnl } : null
+  const side = direction === 'bullish' ? 'long' : 'short'
+  const atr  = calcATR(candles, eventIdx)
+  const dist = atr * STOP_ATR_MULT
+  if (dist <= 0) return null
+  const rawEntry   = candles[eventIdx].close
+  const entryPrice = slip(rawEntry, side === 'long', SLIPPAGE_ENTRY_TICKS)
+  const stopPrice   = side === 'long' ? entryPrice - dist : entryPrice + dist
+  const targetPrice = side === 'long' ? entryPrice + dist * R_MULTIPLE : entryPrice - dist * R_MULTIPLE
+
+  for (let i = eventIdx + 1; i < Math.min(candles.length, eventIdx + 1 + MAX_HOLD_BARS); i++) {
+    const c = candles[i]
+    let rawExit = null, exitIsBuy = null
+    if (side === 'long') {
+      if (c.low <= stopPrice)        { rawExit = stopPrice;   exitIsBuy = false }
+      else if (c.high >= targetPrice) { rawExit = targetPrice; exitIsBuy = false }
+    } else {
+      if (c.high >= stopPrice)       { rawExit = stopPrice;   exitIsBuy = true }
+      else if (c.low <= targetPrice)  { rawExit = targetPrice; exitIsBuy = true }
+    }
+    if (rawExit != null) {
+      const slipTicks = rawExit === stopPrice ? SLIPPAGE_STOP_TICKS : SLIPPAGE_TARGET_TICKS
+      const exitPrice = slip(rawExit, exitIsBuy, slipTicks)
+      const dir = side === 'long' ? 1 : -1
+      const stopDist = Math.abs(entryPrice - stopPrice)
+      const contracts = stopDist > 0
+        ? Math.max(1, Math.min(6, Math.floor(MAX_LOSS_DOLLARS / (stopDist * POINT_VALUE))))
+        : 1
+      const grossPnl   = dir * (exitPrice - entryPrice) * POINT_VALUE * contracts
+      const commission = COMMISSION_PER_SIDE * 2 * contracts
+      const dollarPnl  = grossPnl - commission
+      const rMult      = stopDist > 0 ? dir * (exitPrice - entryPrice) / stopDist : 0
+      return { rMult, dollarPnl }
+    }
+  }
+  return null // neither barrier hit within MAX_HOLD_BARS
 }
 
 function quantileBuckets(items, valueKey, k = 5) {
@@ -716,7 +759,6 @@ function permuteBars(candles, startIndex = 0) {
       relHigh: Math.log(c.high) - logOpen,
       relLow: Math.log(c.low) - logOpen,
       relClose: Math.log(c.close) - logOpen,
-      volume: c.volume || 0,
     })
     gaps.push(logOpen - Math.log(prevClose))
   }
@@ -744,7 +786,7 @@ function permuteBars(candles, startIndex = 0) {
     const high  = Math.exp(logOpen + shuffledRel[k].relHigh)
     const low   = Math.exp(logOpen + shuffledRel[k].relLow)
     const close = Math.exp(logOpen + shuffledRel[k].relClose)
-    out[i] = { time: candles[i].time, open, high, low, close, volume: shuffledRel[k].volume }
+    out[i] = { time: candles[i].time, open, high, low, close }
     prevClose = close
   }
   return out
@@ -768,7 +810,7 @@ function runPermutationTest(candles, hypothesis, numPermutations = 200) {
   }
 
   permMetrics.sort((a, b) => a - b)
-  const pValue = (1 + asGoodOrBetter) / (1 + numPermutations)
+  const pValue = asGoodOrBetter / numPermutations
   const median = permMetrics[Math.floor(permMetrics.length / 2)]
   const p25 = permMetrics[Math.floor(permMetrics.length * 0.25)]
   const p75 = permMetrics[Math.floor(permMetrics.length * 0.75)]
@@ -816,8 +858,8 @@ function detectORBEvents(candles) {
     const c = candles[i]
     const d = dayKey(c.time)
     if (d !== day) { day = d; rangeHigh = -Infinity; rangeLow = Infinity; fired = false }
-    const { minute } = nyClock(c.time)
-    if (minute >= 570 && minute < 600) {
+    const h = utcHour(c.time), m = utcMinute(c.time)
+    if (h === 13 && m < 30) {
       rangeHigh = Math.max(rangeHigh, c.high)
       rangeLow  = Math.min(rangeLow, c.low)
       continue
@@ -862,28 +904,91 @@ function runGapAnalysis(candles) {
 // Every fill below goes through slip() and every closed trade pays
 // commission on both sides. Returns the raw trade list (used for
 // summarize(), the per-session breakdown, and walk-forward stitching).
-function legacyExecution() {
-  return {
-    pointValue: POINT_VALUE, tickSize: TICK_SIZE, riskDollars: MAX_LOSS_DOLLARS,
-    commissionPerSide: COMMISSION_PER_SIDE, entrySlipTicks: SLIPPAGE_ENTRY_TICKS,
-    stopSlipTicks: SLIPPAGE_STOP_TICKS, exitSlipTicks: SLIPPAGE_TARGET_TICKS,
-    stopATR: STOP_ATR_MULT, targetR: R_MULTIPLE, maxHoldBars: MAX_HOLD_BARS,
-    cooldownBars: COOLDOWN_BARS, rthOnly: false,
-  }
-}
-function runEngine(candles, signalFn) {
-  const wrapped = i => {
-    // State must consume every bar even while execution is blocked.
+function runEngine(candles, signalFn, opts = {}) {
+  const fixedContracts = opts.fixedContracts ?? null // null = existing $500-cap risk-adjusted sizing (unchanged default)
+  let pos = null, entryIdx = null, entryPrice = null, stopPrice = null, targetPrice = null, side = null
+  let lastExitIdx = -Infinity
+  const trades = []
+  let blockedByPolicy = 0
+
+  // Known in advance, doesn't depend on the trade's outcome:
+  const commissionInPoints  = (COMMISSION_PER_SIDE * 2) / POINT_VALUE
+  const worstCaseSlipPoints = (SLIPPAGE_ENTRY_TICKS + SLIPPAGE_STOP_TICKS) * TICK_SIZE
+  const frictionCostPoints  = commissionInPoints + worstCaseSlipPoints
+
+  for (let i = 20; i < candles.length; i++) {
+    const c = candles[i]
+
+    if (pos) {
+      const barsOpen = i - entryIdx
+      let rawExit = null, reason = null, exitIsBuy = null
+      if (side === 'long') {
+        if (c.low  <= stopPrice)        { rawExit = stopPrice;   reason = 'stop';   exitIsBuy = false }
+        else if (c.high >= targetPrice) { rawExit = targetPrice; reason = 'target'; exitIsBuy = false }
+      } else {
+        if (c.high >= stopPrice)        { rawExit = stopPrice;   reason = 'stop';   exitIsBuy = true }
+        else if (c.low  <= targetPrice) { rawExit = targetPrice; reason = 'target'; exitIsBuy = true }
+      }
+      if (rawExit == null && barsOpen >= MAX_HOLD_BARS) {
+        rawExit = c.close; reason = 'time'; exitIsBuy = side === 'short'
+      }
+
+      if (rawExit != null) {
+        const slipTicks = reason === 'stop' ? SLIPPAGE_STOP_TICKS
+          : reason === 'target' ? SLIPPAGE_TARGET_TICKS
+          : SLIPPAGE_ENTRY_TICKS
+        const exitPrice = slip(rawExit, exitIsBuy, slipTicks)
+
+        const dir = side === 'long' ? 1 : -1
+        const stopDist = Math.abs(entryPrice - stopPrice)
+        const contracts = fixedContracts != null
+          ? fixedContracts
+          : (stopDist > 0 ? Math.max(1, Math.min(6, Math.floor(MAX_LOSS_DOLLARS / (stopDist * POINT_VALUE)))) : 1)
+        const grossPnl = dir * (exitPrice - entryPrice) * POINT_VALUE * contracts
+        const commission = COMMISSION_PER_SIDE * 2 * contracts // entry + exit
+        const dollarPnl = grossPnl - commission
+        const rMult = stopDist > 0 ? dir * (exitPrice - entryPrice) / stopDist : 0
+
+        // entrySession: the session the trade was OPENED in — what a router
+        // would have used to route it. Used for the per-session breakdown.
+        trades.push({
+          entryIdx, exitIdx: i, side, entryPrice, exitPrice, contracts,
+          grossPnl: +grossPnl.toFixed(2), commission: +commission.toFixed(2),
+          dollarPnl: +dollarPnl.toFixed(2), rMult, reason, barsHeld: barsOpen,
+          time: candles[entryIdx].time,
+          exitTime: c.time,
+          session: getSession(candles[entryIdx].time),
+        })
+        pos = null; lastExitIdx = i
+      }
+      continue
+    }
+
+    if (i - lastExitIdx < COOLDOWN_BARS) continue
+
     const action = signalFn(i)
+    if (action !== 'buy' && action !== 'sell') continue
+
     const atr = calcATR(candles, i)
-    const friction = (COMMISSION_PER_SIDE * 2) / POINT_VALUE + (SLIPPAGE_ENTRY_TICKS + SLIPPAGE_STOP_TICKS) * TICK_SIZE
-    if (friction > atr * STOP_ATR_MULT * MAX_FRICTION_TO_R_RATIO) return 0
-    return action === 'buy' ? 1 : action === 'sell' ? -1 : 0
+    const dist = atr * STOP_ATR_MULT
+    if (dist <= 0) continue
+
+    // Stage X — Decision Policy gate. Reject before opening if friction
+    // alone would consume too large a share of this trade's stop distance.
+    if (frictionCostPoints > dist * MAX_FRICTION_TO_R_RATIO) {
+      blockedByPolicy++
+      continue
+    }
+
+    side = action === 'buy' ? 'long' : 'short'
+    const rawEntry = c.close
+    entryPrice  = slip(rawEntry, side === 'long', SLIPPAGE_ENTRY_TICKS)
+    stopPrice   = side === 'long' ? entryPrice - dist : entryPrice + dist
+    targetPrice = side === 'long' ? entryPrice + dist * R_MULTIPLE : entryPrice - dist * R_MULTIPLE
+    entryIdx = i
+    pos = true
   }
-  const result = simulateResearch(candles, wrapped, legacyExecution())
-  result.trades.forEach(t => { t.session = getSession(t.time) })
-  // Risk rejects are separate from the removed legacy friction counter.
-  return { trades: result.trades, blockedByPolicy: 0 }
+  return { trades, blockedByPolicy }
 }
 
 function summarize(trades) {
@@ -1242,6 +1347,13 @@ export default function HypothesisLab() {
   const [ptError, setPtError]       = useState('')
   const [ptResults, setPtResults]   = useState(null)
 
+  const [scHypId, setScHypId]       = useState('h8_ma_cross_session')
+  const [scMonths, setScMonths]     = useState([])
+  const [scRunning, setScRunning]   = useState(false)
+  const [scLoadMsg, setScLoadMsg]   = useState('')
+  const [scError, setScError]       = useState('')
+  const [scResults, setScResults]   = useState(null) // { riskAdjusted, fixed6 }
+
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
   function toggle(setBucket) {
@@ -1430,11 +1542,32 @@ export default function HypothesisLab() {
     }
   }
 
+  async function runSizingComparisonUI() {
+    if (!scMonths.length) { setScError('Select at least one month.'); return }
+    setScError('')
+    setScRunning(true)
+    setScResults(null)
+    try {
+      setScLoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(SYMBOL, '5min', [...scMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      const hyp = HYPOTHESES.find((h) => h.id === scHypId)
+      setScLoadMsg('Running both sizing modes\u2026')
+      const fn1 = hyp.makeSignal(candles)
+      const riskAdjusted = summarize(runEngine(candles, fn1).trades)
+      const fn2 = hyp.makeSignal(candles)
+      const fixed6 = summarize(runEngine(candles, fn2, { fixedContracts: 6 }).trades)
+      setScResults({ riskAdjusted, fixed6 })
+    } catch (e) {
+      setScError(e.message)
+    } finally {
+      setScRunning(false)
+      setScLoadMsg('')
+    }
+  }
+
   return (
     <div>
-      <PatternResearch />
       <div className="card">
-        <p>Legacy experiments below now use corrected execution and net R. Historical results need to be rerun. Their older UTC session definitions remain.</p>
         <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Hypothesis Lab</h2>
         <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
           Isolated from the live signal pipeline \u2014 nothing here touches active_strategy,
@@ -1524,7 +1657,8 @@ export default function HypothesisLab() {
       <div className="card" style={{ marginTop: 20 }}>
         <div className="card-title">2. Rolling walk-forward</div>
         <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.5 }}>
-          These are month-by-month robustness checks. Months previously inspected to design a rule are development data, even when the rules are now fixed. Pick a run of months; each hypothesis runs on every month independently, then all
+          These hypotheses are fixed rules \u2014 nothing is fit per month, so every month here is out-of-sample
+          by construction. Pick a run of months; each hypothesis runs on every month independently, then all
           the trades get stitched into one chronological equity curve and broken down by session \u2014 a larger,
           more robust sample than Train alone for deciding if a session router is worth building.
         </p>
@@ -1605,7 +1739,7 @@ export default function HypothesisLab() {
           from contextual features that might explain why the same event produces different outcomes at
           different times: recent range (ATR), wick size on the event candle, and trend steepness (normalized
           20-SMA slope). These are exactly the things discretion usually weighs without naming — this
-          quantifies them instead. These intervals omit dependence and selection corrections; use the new research panel for day-block validation. Exploratory quintile breakdown with naive 95% intervals (overlapping events are not independent), not a single chosen
+          quantifies them instead. Full quintile breakdown with 95% confidence intervals, not a single chosen
           threshold. A real relationship shows buckets separating with non-overlapping or clearly trending
           intervals across a real sample size — one bucket looking best on its own is not evidence; that
           exact pattern is what broke H7b.
@@ -1670,9 +1804,11 @@ export default function HypothesisLab() {
         <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
           A different question than walk-forward: not "did this hold up on unseen months" but "is this
           result even distinguishable from what a worthless rule could produce by chance." Generates 200
-          price-series permutations \u2014 preserved total log-price change, but altered ordering and dependence; the actual sequential pattern (trends, the specific highs/lows an event depends on) is
+          price-series permutations \u2014 same overall drift, mean, stdev, skew, and kurtosis as the real
+          data, but the actual sequential pattern (trends, the specific highs/lows an event depends on) is
           destroyed \u2014 and runs the selected hypothesis on each one, unchanged. If the real expectancy
-          isn\u2019t clearly better than most permutations, this test does not support an edge under its chosen null model. This can take a while to run \u2014 it re-runs the full engine 200 times.
+          isn\u2019t clearly better than most of the permutations, the rule isn\u2019t capturing real
+          structure. This can take a while to run \u2014 it re-runs the full engine 200 times.
         </p>
       </div>
 
@@ -1732,6 +1868,91 @@ export default function HypothesisLab() {
             Permutation expectancy distribution: min {ptResults.permMin.toFixed(3)}R, 25th {ptResults.permP25.toFixed(3)}R,
             median {ptResults.permMedian.toFixed(3)}R, 75th {ptResults.permP75.toFixed(3)}R, max {ptResults.permMax.toFixed(3)}R
           </div>
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">5. Position Sizing Comparison</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          Runs the same hypothesis, on the same data, through two sizing modes: this Lab\u2019s existing
+          $500-cap risk-adjusted sizing (fewer contracts on wide stops, up to 6 on tight ones) versus a fixed
+          6 contracts on every trade regardless of stop distance \u2014 the rule described in the outside
+          Reddit source. An earlier bottom-up review of this Lab\u2019s own H3a trade output found the
+          6-contract regime specifically underperformed (it corresponds to tight, low-ATR stops); this checks
+          whether that finding holds on H8 specifically.
+        </p>
+      </div>
+
+      <div className="card">
+        <div className="row" style={{ marginBottom: 8 }}>
+          <label className="lbl" style={{ margin: 0 }}>Hypothesis to test</label>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {HYPOTHESES.map((h) => (
+            <button
+              key={h.id}
+              onClick={() => setScHypId(h.id)}
+              style={{
+                padding: '6px 10px', borderRadius: 6,
+                border: `1px solid ${scHypId === h.id ? 'var(--blue)' : 'var(--border)'}`,
+                background: scHypId === h.id ? 'rgba(45,108,223,0.15)' : 'var(--surface)',
+                color: scHypId === h.id ? 'var(--blue)' : 'var(--text-muted)',
+                fontSize: 11, fontWeight: scHypId === h.id ? 600 : 400, cursor: 'pointer',
+              }}
+            >
+              {h.id}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <MonthPicker label="Sizing comparison months" selected={scMonths} onToggle={toggle(setScMonths)} />
+
+      {scError && <div className="error-box">{scError}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runSizingComparisonUI} disabled={scRunning} style={{ flex: 1, padding: '11px' }}>
+          {scRunning ? `\u23f3 ${scLoadMsg}` : '\u25b6 Run sizing comparison'}
+        </button>
+      </div>
+
+      {scResults && (
+        <div className="card">
+          <div className="card-title">{scHypId}</div>
+          <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                <th style={{ textAlign: 'left', padding: '4px 8px' }}>Sizing mode</th>
+                <th style={{ padding: '4px 8px' }}>Trades</th>
+                <th style={{ padding: '4px 8px' }}>Win%</th>
+                <th style={{ padding: '4px 8px' }}>Expectancy</th>
+                <th style={{ padding: '4px 8px' }}>P&amp;L</th>
+                <th style={{ padding: '4px 8px' }}>Max DD</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style={{ padding: '4px 8px' }}>Risk-adjusted ($500 cap)</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{scResults.riskAdjusted.trades}</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{scResults.riskAdjusted.winRate}%</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{scResults.riskAdjusted.expectancyR >= 0 ? '+' : ''}{scResults.riskAdjusted.expectancyR}R</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right', color: scResults.riskAdjusted.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>
+                  {scResults.riskAdjusted.totalDollar >= 0 ? '+' : ''}${scResults.riskAdjusted.totalDollar}
+                </td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>-${scResults.riskAdjusted.maxDD}</td>
+              </tr>
+              <tr>
+                <td style={{ padding: '4px 8px' }}>Fixed 6 contracts</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{scResults.fixed6.trades}</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{scResults.fixed6.winRate}%</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{scResults.fixed6.expectancyR >= 0 ? '+' : ''}{scResults.fixed6.expectancyR}R</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right', color: scResults.fixed6.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>
+                  {scResults.fixed6.totalDollar >= 0 ? '+' : ''}${scResults.fixed6.totalDollar}
+                </td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>-${scResults.fixed6.maxDD}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       )}
     </div>
