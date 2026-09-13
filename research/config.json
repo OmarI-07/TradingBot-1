@@ -22,6 +22,8 @@
     "minActiveDayFraction": 0.25,
     "targetPatterns": 3,
     "bootstrapReps": 2000,
-    "permutations": 0
+    "permutations": 0,
+    "suite": "retest-v2",
+    "mode": "development"
   }
 }

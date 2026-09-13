@@ -1,3 +1,57 @@
+# Retest v2 rebuild (September 12, 2026)
+
+The browser defaults to Retest v2 and Development mode. The CLI config does the same.
+Development evaluates training and validation only: final test simulation and holdout-lock callbacks do not run.
+Reports distinguish evaluated candidates from candidates that passed validation.
+Old checkpoints are incompatible with engine version nq-research-2; preserve them as research history.
+
+## Registered experiment
+
+14 candidates: 72/144-bar prior high/low breakout, up to six bars to retest and reclaim,
+1R target, existing ATR stop and 24-bar maximum hold. Each lookback has a baseline
+and six separate filters (no combinations or automated tuning):
+
+- Morning: breakout and reclaim before 11:30 New York.
+- Strong close: reclaim closes in the directional outer 25% of its candle.
+- Trend: prior 36-close regression slope agrees with breakout direction.
+- Compression: prior 12-bar range is at most half the preceding 24-bar range.
+- Volume: breakout volume is at least 1.5 times the previous 20-bar mean; missing/zero history rejects it.
+- Opening range: complete six-bar 09:30–10:00 range and breakout close beyond its directional boundary.
+
+All variants arm only during RTH, clear pending setups across missing bars or dates,
+and signal at reclaim close for the existing next-open execution engine. Baselines
+therefore intentionally differ from the old retest's overnight setup behavior.
+Volume compares adjacent bars, not a seasonally adjusted time-of-day volume baseline.
+All variants belong to one family: only two train-selected variants reach validation,
+and at most one becomes a frozen finalist. They cannot satisfy a target of three independent patterns.
+
+## Run once
+
+```powershell
+npm run test:research
+node research/run.mjs --data "C:\path\to\nq-candles.json" --out research-runs/retest-v2-development --config research/config.json
+```
+
+In HypothesisLab choose Retest v2 and Development: holdout closed, load the same candle
+file, then Start registered search. Keep execution/risk settings consistent with the
+previous experiment if comparing results (the shipped risk default is $100; the user's
+earlier report used $200). Export the report after completion.
+
+The earlier validation period informed these new hypotheses, so it is now development
+history, even if a revised strategy passes. Freeze the research specification before
+using untouched dates. Explicit `search.mode: "confirmatory"` enables the final test;
+it is not a certification of significance. MCPT remains optional and unchanged.
+Do not repeatedly alter thresholds to obtain passes. The original 180-candidate suite
+remains available as `search.suite: "legacy"`. Watch mode rejects development mode;
+use a single run while researching this rebuild.
+
+No real candle dataset accompanied this rebuild; downloaded reports alone cannot
+reproduce trades. Performance is unmeasured until a candle dataset is run.
+
+---
+
+The following is the original v1 documentation; the defaults and workflow above supersede it.
+
 # NQ Pattern Research
 
 This update adds a research search to the existing Hypothesis Lab and a dependency-free Node runner. It is based on your repository snapshot `d271a22`. The research module does not place orders or publish strategies to the live bot.

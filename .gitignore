@@ -4,3 +4,5 @@ dist/
 .env.*
 research-runs/
 *.log
+
+.npm-cache/

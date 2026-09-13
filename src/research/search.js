@@ -1,7 +1,7 @@
 import { ENGINE_VERSION, executionConfig, validateCandles, prepare, simulate, summarize } from './engine.js';
 import { buildCandidates, createFactory, quantile } from './hypotheses.js';
 
-export const SEARCH_DEFAULTS = Object.freeze({ seed: 417, minDays: 120,
+export const SEARCH_DEFAULTS = Object.freeze({ seed: 417, minDays: 120, suite: 'legacy', mode: 'development',
   minTrainTrades: 80, minValidationTrades: 40, minTestTrades: 40,
   minWinRate: .50, minExpectancyR: .03, minTradesPerDay: .5,
   minActiveDayFraction: .25, minProfitableMonthFraction: .5,
@@ -63,6 +63,8 @@ function compact(result) {return {stats:result.stats,maxDrawdown:result.maxDrawd
 function rank(row) {return row.train.stats.expectancyR*Math.sqrt(row.train.stats.trades);}
 export function validateSearchConfig(input={}) {
   const cfg={...SEARCH_DEFAULTS,...input};
+  if(!['legacy','retest-v2'].includes(cfg.suite))throw new Error('Invalid suite');
+  if(!['development','confirmatory'].includes(cfg.mode))throw new Error('Invalid mode');
   for(const k of ['minDays','minTrainTrades','minValidationTrades','minTestTrades','shortlistSize','targetPatterns','bootstrapReps'])
     if(!Number.isInteger(cfg[k]) || cfg[k]<1)throw new Error(`Invalid ${k}`);
   for(const k of ['minWinRate','minActiveDayFraction','minProfitableMonthFraction'])
@@ -94,7 +96,7 @@ export function permuteCandles(candles, clock, seed) {
 export async function runSearch(candles, options={}, hooks={}) {
   const cfg=validateSearchConfig(options.search),execution=executionConfig(options.execution);
   const quality=validateCandles(candles,execution.intervalMs), data=prepare(candles),split=splitDays(data,cfg.minDays);
-  const candidates=buildCandidates(),dataId=fingerprint(candles),runId=fingerprint({dataId,cfg,execution,version:ENGINE_VERSION});
+  const candidates=buildCandidates(cfg.suite),dataId=fingerprint(candles),runId=fingerprint({dataId,cfg,execution,version:ENGINE_VERSION});
   let state=hooks.checkpoint || {runId,dataId,version:ENGINE_VERSION,options:{search:cfg,execution},rows:[],permutationScores:[]};
   if(state.runId!==runId)throw new Error('Checkpoint does not match these data, settings, or code version.');
   const save=async()=>{if(hooks.onCheckpoint)await hooks.onCheckpoint(state);};
@@ -164,12 +166,12 @@ export async function runSearch(candles, options={}, hooks={}) {
     if(state.mcpt && state.mcpt.pValue>.05)state.finalists=[];
     state.test=[];await save();
   }
-  if(state.finalists.length && !state.holdoutOpened){
+  if(cfg.mode==='confirmatory' && state.finalists.length && !state.holdoutOpened){
     // Called by UI/CLI to persist a data-level holdout lock before first use.
     await hooks.onHoldoutOpen?.({dataId,runId,finalists:state.finalists});
     state.holdoutOpened=true;await save();
   }
-  for(let j=state.test.length;j<state.finalists.length;j++){
+  for(let j=state.test.length;cfg.mode==='confirmatory' && j<state.finalists.length;j++){
     await tick('Testing frozen finalists',j,state.finalists.length);
     const candidate=candidates.find(c=>c.id===state.finalists[j]),r=reportRange(factory,candidate,testRange,execution);
     const lower=dayBootstrapLower(r.trades,testRange.days,cfg.bootstrapReps,.05/state.finalists.length,cfg.seed+500+j);
@@ -181,8 +183,10 @@ export async function runSearch(candles, options={}, hooks={}) {
   const accepted=state.test.filter(t=>!t.failures.length);
   state.report={version:ENGINE_VERSION,runId,dataId,createdAt:new Date().toISOString(),execution,search:cfg,quality,split,
     testedCandidates:candidates.length,training:state.rows,validation:state.validation,finalists:state.test,
-    accepted,mcpt:state.mcpt||null,status:accepted.length>=cfg.targetPatterns?'TARGET_MET':'EXHAUSTED',
-    message:accepted.length>=cfg.targetPatterns?'Three research candidates passed; forward paper validation remains.':
+    frozenCandidateIds:state.finalists,holdoutOpened:!!state.holdoutOpened,
+    validationPassed:state.validation.filter(v=>!v.failures.length).length,
+    accepted,mcpt:state.mcpt||null,status:cfg.mode==='development'?'DEVELOPMENT_COMPLETE':accepted.length>=cfg.targetPatterns?'TARGET_MET':'EXHAUSTED',
+    message:cfg.mode==='development'?`Development complete: ${state.validation.filter(v=>!v.failures.length).length} passed validation; final holdout remains closed.`:accepted.length>=cfg.targetPatterns?'Three research candidates passed; forward paper validation remains.':
       `Found ${accepted.length}/${cfg.targetPatterns}. Registered search exhausted; no thresholds were relaxed.`,
     limitations:['Historical research, not a profitability guarantee.',
       'Repeated past use of these dates by you is not detectable; previously inspected data are not untouched.',

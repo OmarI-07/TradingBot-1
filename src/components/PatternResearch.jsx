@@ -3,7 +3,7 @@ import { fetchSelectedMonths, getAvailableMonths } from '../massiveFinance';
 import { parseCandles, tradeCSV } from '../research/data.js';
 import { buildCandidates } from '../research/hypotheses.js';
 
-const KEY='nq_research_checkpoint_v1',LOCKS='nq_research_holdouts_v1';
+const KEY='nq_research_checkpoint_v2',LOCKS='nq_research_holdouts_v1';
 function download(name,text,type='application/json'){
   const url=URL.createObjectURL(new Blob([text],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
@@ -12,6 +12,7 @@ export default function PatternResearch(){
   const [candles,setCandles]=useState(null),[months,setMonths]=useState([]),[error,setError]=useState('');
   const [running,setRunning]=useState(false),[loading,setLoading]=useState(false),[progress,setProgress]=useState(null),[report,setReport]=useState(null);
   const [mcpt,setMcpt]=useState(false),[risk,setRisk]=useState(100),[pointValue,setPointValue]=useState(2);
+  const [suite,setSuite]=useState('retest-v2'),[mode,setMode]=useState('development');
   const [minWin,setMinWin]=useState(50),[rate,setRate]=useState(.5);
   const worker=useRef(null),checkpoint=useRef(null);
   useEffect(()=>{
@@ -47,14 +48,14 @@ export default function PatternResearch(){
     };
     w.postMessage({type:'start',candles,checkpoint:resume?checkpoint.current:null,
       options:resume && checkpoint.current?.options ? checkpoint.current.options : {execution:{riskDollars:Number(risk),pointValue:Number(pointValue)},
-        search:{minWinRate:Number(minWin)/100,minTradesPerDay:Number(rate),permutations:mcpt?199:0}}});
+        search:{suite,mode,minWinRate:Number(minWin)/100,minTradesPerDay:Number(rate),permutations:mcpt?199:0}}});
   }
   const inputStyle={background:'var(--surface)',color:'var(--text)',border:'1px solid var(--border)',padding:8,borderRadius:6,width:90};
   return <div className="card" style={{marginBottom:20}}>
     <h2>Pattern Research â€” new hypotheses</h2>
     <p style={{color:'var(--text-muted)',lineHeight:1.6}}>
-      Search {buildCandidates().length} registered candidates across six families. Learn price-shape categories on training data,
-      validate a shortlist, then test up to three frozen finalists. A run can finish with zero qualifying patterns.
+      Search {buildCandidates(suite).length} predefined candidates. Screen training data,
+      validate a shortlist, and keep the final holdout closed in development mode. A run can finish with zero qualifying patterns.
       This panel is research only. Nothing is sent to your live bot.
     </p>
     <p>Use at least 120 trading days of NQ 5-minute candles, with UTC timestamps at bar open.
@@ -69,6 +70,8 @@ export default function PatternResearch(){
     </details>
     {candles&&<p>{candles.length.toLocaleString()} candles loaded. <button className="btn-sm" onClick={()=>download('nq-candles.json',JSON.stringify(candles))}>Export candles</button></p>}
     <div style={{display:'flex',flexWrap:'wrap',gap:16,margin:'16px 0'}}>
+      <label>Research suite<br/><select value={suite} disabled={running} onChange={e=>setSuite(e.target.value)}><option value="retest-v2">Retest v2 (14 candidates)</option><option value="legacy">Original suite (180 candidates)</option></select></label>
+      <label>Run mode<br/><select value={mode} disabled={running} onChange={e=>setMode(e.target.value)}><option value="development">Development: holdout closed</option><option value="confirmatory">Confirmatory: open final holdout</option></select></label>
       <label>Execution contract<br/><select style={inputStyle} value={pointValue} disabled={running} onChange={e=>setPointValue(+e.target.value)}><option value={2}>MNQ</option><option value={20}>NQ</option></select></label>
       <label>Risk budget $<br/><input style={inputStyle} type="number" min={1} value={risk} disabled={running} onChange={e=>setRisk(e.target.value)}/></label>
       <label>Minimum win %<br/><input style={inputStyle} type="number" min={0} max={100} value={minWin} disabled={running} onChange={e=>setMinWin(e.target.value)}/></label>
@@ -88,13 +91,15 @@ export default function PatternResearch(){
     {error&&<p role="alert" style={{color:'var(--amber)'}}>{error}</p>}
     {report&&<>
       <h3>{report.message}</h3>
-      <p>{report.testedCandidates} candidates screened; {report.validation.length} validated; {report.finalists.length} finalists tested.</p>
+      <p>{report.testedCandidates} candidates screened; {report.validation.length} evaluated on validation; {report.validation.filter(v=>!v.failures.length).length} passed validation; {report.finalists.length} finalists tested.</p>
       {!report.mcpt&&<p>Selection-aware MCPT was not run. This report does not establish significance for the full search.</p>}
       {report.mcpt&&<p>Training search MCPT p-value: {report.mcpt.pValue.toFixed(4)}.</p>}
       <button className="btn-sm" onClick={()=>download('research-report.json',JSON.stringify(report,null,2))}>Download full report</button>
       <div style={{overflowX:'auto'}}><table style={{width:'100%',fontSize:13,marginTop:14}}><thead><tr><th>Frozen finalist</th><th>Trades</th><th>Win rate</th><th>Net R/trade</th><th>Result</th></tr></thead>
         <tbody>{report.finalists.map((r,i)=><tr key={r.candidate.id}><td>{r.candidate.family}<br/><small>{JSON.stringify(r.candidate.params)}</small></td><td>{r.result.stats.trades}</td><td>{pct(r.result.stats.winRate)}</td><td>{r.result.stats.expectancyR.toFixed(3)}</td><td>{r.failures.length?r.failures.join('; '):'Passed historical gates'}<br/><button className="btn-sm" onClick={()=>download(`finalist-${i+1}.csv`,tradeCSV(r.trades),'text/csv')}>Trades CSV</button></td></tr>)}</tbody></table></div>
-      <details><summary>Training and validation diagnostics</summary><div style={{maxHeight:360,overflow:'auto'}}>{report.training.map(r=><p key={r.candidate.id} style={{fontSize:12}}>{r.candidate.id}<br/>{r.train.stats.trades} trades Â· {pct(r.train.stats.winRate)} wins Â· {r.train.stats.expectancyR.toFixed(3)}R Â· {r.trainReasons.join('; ')||'Passed training gates'}</p>)}</div></details>
+      <h4>Validation results</h4>
+      {report.validation.map(r=><p key={r.candidate.id}><strong>{r.candidate.id}</strong><br/>{r.result.stats.trades} trades · {pct(r.result.stats.winRate)} wins · {r.result.stats.expectancyR.toFixed(3)} net R/trade · bootstrap lower bound {r.lower==null?'unavailable':r.lower.toFixed(3)}R · stressed expectancy {r.stress.stats.expectancyR.toFixed(3)}R<br/>{r.failures.join('; ')||'Passed validation gates; not a live-trading approval'}</p>)}
+      <details><summary>Training diagnostics</summary><div style={{maxHeight:360,overflow:'auto'}}>{report.training.map(r=><p key={r.candidate.id} style={{fontSize:12}}>{r.candidate.id}<br/>{r.train.stats.trades} trades Â· {pct(r.train.stats.winRate)} wins Â· {r.train.stats.expectancyR.toFixed(3)}R Â· {r.trainReasons.join('; ')||'Passed training gates'}</p>)}</div></details>
     </>}
   </div>;
 }

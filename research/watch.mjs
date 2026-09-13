@@ -14,6 +14,7 @@ if(!flags.data){
 const poll=Number(flags.poll || 60);if(!Number.isFinite(poll)||poll<5)throw new Error('Poll interval must be at least 5 seconds.');
 const options=flags.config?JSON.parse(await fs.readFile(flags.config,'utf8')):{};
 const search=validateSearchConfig(options.search),out=path.resolve(flags.out||'research-runs/watch');
+if(search.mode==='development')throw new Error('Use run.mjs for a single development experiment. Watch mode requires explicit confirmatory mode.');
 const settingsId=fingerprint({options,version:ENGINE_VERSION});await fs.mkdir(out,{recursive:true});
 const stateFile=path.join(out,'watch-state.json');let state={settingsId,lastTestEnd:0,attemptedData:null},stopped=false,lastMessage='';
 try{state=JSON.parse(await fs.readFile(stateFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}

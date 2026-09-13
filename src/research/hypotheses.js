@@ -51,12 +51,18 @@ export function fitMotifThresholds(data, trainEnd, window) {
 function motifCode(features, thresholds) {
   return features.map((v,k)=>v<thresholds[k][0]?'D':v>thresholds[k][1]?'U':'F').join('');
 }
-export function buildCandidates() {
+export function buildCandidates(suite='legacy') {
   const out=[];
   function add(family,params,targetR,exitMode='fixed') {
     const id=[family,...Object.entries(params).map(([k,v])=>`${k}=${v}`),`R=${targetR}`,exitMode].join('|');
     out.push({id,family,params,execution:{targetR,maxHoldBars:24},exitMode});
   }
+  if(suite==='retest-v2') {
+    for(const window of [72,144])for(const filter of ['baseline','morning','strong-close','trend','compression','volume','opening-range'])
+      add('retest-v2',{window,wait:6,filter},1);
+    return out;
+  }
+  if(suite!=='legacy')throw new Error('Unknown candidate suite');
   for(const window of [36,72,144])for(const buffer of [0,.15,.3])for(const r of [1,1.5])
     add('trendline',{window,buffer},r);
   for(const window of [72,144,288])for(const kappa of [.1,.25,.5])for(const mode of ['fixed','quiet-exit'])
@@ -78,7 +84,47 @@ export function createFactory(candles, trainEnd, precomputed=null, frozenModels=
     const key=family+JSON.stringify(p)+exitMode;
     if(cache.has(key))return cache.get(key);
     const values=new Int8Array(candles.length), exits=new Uint8Array(candles.length);
-    if(family==='volatility'){
+    if(family==='retest-v2'){
+      let pending=null,day='',orHigh=-Infinity,orLow=Infinity,orCount=0;
+      for(let i=0;i<candles.length;i++){
+        const c=candles[i],clock=data.clock[i];
+        if(clock.day!==day){day=clock.day;pending=null;orHigh=-Infinity;orLow=Infinity;orCount=0;}
+        if(clock.minute>=570 && clock.minute<600){orHigh=Math.max(orHigh,c.high);orLow=Math.min(orLow,c.low);orCount++;}
+        if(i<p.window)continue;
+        if(c.time-candles[i-1].time!==300000)pending=null;
+        if(clock.minute<570 || clock.minute>=950){pending=null;continue;}
+        if(pending){
+          const q=pending;
+          if(i-q.i>p.wait)pending=null;
+          else if(q.direction===1?c.low<=q.level && c.close>q.level:c.high>=q.level && c.close<q.level){
+            const strength=c.high>c.low?(q.direction===1?c.close-c.low:c.high-c.close)/(c.high-c.low):0;
+            const allowed=p.filter!=='strong-close'||strength>=.75;
+            if(allowed && (p.filter!=='morning'||clock.minute<690))values[i]=q.direction;
+            pending=null;
+          }
+        }
+        if(pending || values[i])continue;
+        let upper=-Infinity,lower=Infinity;
+        for(let k=i-p.window;k<i;k++){upper=Math.max(upper,candles[k].high);lower=Math.min(lower,candles[k].low);}
+        const direction=c.close>upper?1:c.close<lower?-1:0;
+        if(!direction)continue;
+        let allowed=true;
+        if(p.filter==='morning')allowed=clock.minute<690;
+        if(p.filter==='trend')allowed=direction*trendEnvelope(candles,i,36).slope>0;
+        if(p.filter==='opening-range')allowed=orCount===6 && clock.minute>=600 && (direction===1?c.close>orHigh:c.close<orLow);
+        if(p.filter==='compression'){
+          const recent=candles.slice(i-12,i),prior=candles.slice(i-36,i-12);
+          const range=a=>Math.max(...a.map(b=>b.high))-Math.min(...a.map(b=>b.low));
+          allowed=range(recent)<=.5*range(prior);
+        }
+        if(p.filter==='volume'){
+          const volumes=candles.slice(i-20,i).map(b=>b.volume);
+          const mean=volumes.reduce((a,b)=>a+b,0)/20;
+          allowed=volumes.every(v=>Number.isFinite(v)&&v>0)&&mean>0&&c.volume>=1.5*mean;
+        }
+        if(allowed)pending={i,direction,level:direction===1?upper:lower};
+      }
+    } else if(family==='volatility'){
       const intensity=new Float64Array(candles.length).fill(NaN);let acc=0;
       for(let i=0;i<candles.length;i++){
         if(!(data.atr[i]>0))continue;

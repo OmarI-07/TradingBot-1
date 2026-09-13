@@ -5,7 +5,7 @@
     {
       "path": ".gitignore",
       "status": "added",
-      "sha256": "e314cddde2daec2b6072d82e34a0f9231c5b28bfbfb2778a5fc258f43507a9b5"
+      "sha256": "7dc02d61faac19539c408de4d01e8fee330ff3ba609211bf27ae25fe01b00f70"
     },
     {
       "path": "package.json",
@@ -15,7 +15,7 @@
     {
       "path": "RESEARCH.md",
       "status": "added",
-      "sha256": "e66565c996d7b3ea60bfce53d192d271c81bc7f40041204f327ce484df012f04"
+      "sha256": "de3079d36246fce6b4438416c5f154f96b15c2ff283910b42214f44094e59697"
     },
     {
       "path": "research/.gitignore",
@@ -25,7 +25,7 @@
     {
       "path": "research/config.json",
       "status": "added",
-      "sha256": "a330627bf741418537f811be7ba2e86132fb44c07240e528268c6b759eb2e899"
+      "sha256": "ced66baa6553abbb466b7125f8cebb23d1e6b450677bd837374346340de3c6e9"
     },
     {
       "path": "research/run.mjs",
@@ -35,12 +35,12 @@
     {
       "path": "research/watch.mjs",
       "status": "added",
-      "sha256": "867fb252a1c80f7e8986b5efe8d7617d170f95c289a3f642d0ff57da03aee7ad"
+      "sha256": "45a1ea41bb310e6e3d15441c94dd0ed44121b0f32f21a4ee70ac357221bdd8f8"
     },
     {
       "path": "research/tests/engine.test.mjs",
       "status": "added",
-      "sha256": "7091a0ea2da7f969624c58ec6366586e3836883a7423c739e6b659707b5e9d22"
+      "sha256": "8ece06ccd710e752bcd947aca28c5eff61ac865e0daa128334162a2419c684f7"
     },
     {
       "path": "src/components/HypothesisLab.jsx",
@@ -50,7 +50,7 @@
     {
       "path": "src/components/PatternResearch.jsx",
       "status": "added",
-      "sha256": "8c5e88a096ac57ff275304dc1e707b43d02cc6ebb702f5fa9468f3243f220f6f"
+      "sha256": "72da1cdb9c2fcae5c70756d02bae447bab672447fa6fd98e53292b6c7a2b8621"
     },
     {
       "path": "src/research/data.js",
@@ -60,12 +60,12 @@
     {
       "path": "src/research/engine.js",
       "status": "added",
-      "sha256": "fc520c3556d487c25bb747e749c0ec712e269f4a8d45f8c7cc35b0ee635e380e"
+      "sha256": "200f464785f0e87fa5be204f1c0a4402780467e3ef139155f0f0e074c188501b"
     },
     {
       "path": "src/research/hypotheses.js",
       "status": "added",
-      "sha256": "6eb5555b7e11513ba73cca7eb80b1391b5b4d689030c4137a1cc0bd8be97b6b4"
+      "sha256": "651465728812d222768904a25c646967e5c140eae820cc3aced735fc26caf0a1"
     },
     {
       "path": "src/research/research.worker.js",
@@ -75,17 +75,14 @@
     {
       "path": "src/research/search.js",
       "status": "added",
-      "sha256": "d373e59f316ae160313db651d117fb739ef8582f5a297ff22901898d6c4a3b23"
+      "sha256": "dd8105d348cd72830c894cda868b02e8f2f845f32786b3532ca994ac76e8765b"
     }
   ],
   "verification": {
-    "research_tests": 25,
-    "research_tests_passed": 25,
-    "legacy_hypotheses_exercised": 14,
-    "babel_source_files_compiled": 45,
-    "cli_resume_smoke": "passed",
-    "watch_restart_smoke": "passed",
-    "vite_build": "blocked: sandbox ancestor-directory access denied by esbuild; npm dependencies installed",
-    "real_nq_performance": "not run; no dataset supplied"
+    "research_tests": 28,
+    "research_tests_passed": 28,
+    "jsx_syntax": "passed with Babel parser",
+    "vite_build": "blocked: Windows sandbox ancestor-directory access denied",
+    "real_nq_performance": "not run; report files do not contain source candles"
   }
 }

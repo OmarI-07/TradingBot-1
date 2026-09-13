@@ -108,7 +108,7 @@ export function syntheticDays(days=30){
   }
   return out;
 }
-const searchOptions={execution:{...cfg,riskDollars:100},search:{minDays:20,minTrainTrades:1,minValidationTrades:1,minTestTrades:1,
+const searchOptions={execution:{...cfg,riskDollars:100},search:{mode:'confirmatory',minDays:20,minTrainTrades:1,minValidationTrades:1,minTestTrades:1,
   minWinRate:0,minExpectancyR:0,minTradesPerDay:0,minActiveDayFraction:0,minProfitableMonthFraction:0,
   maxDrawdownR:100,bootstrapReps:50,stressCostMultiplier:1}};
 test('search freezes finalists, resumes deterministically and never forces three',async()=>{
@@ -143,11 +143,44 @@ test('high win rate with large losses is not positive expectancy',()=>{
 test('default search can exhaust noisy synthetic data without inventing three patterns',async()=>{
   const random=rng(217),c=syntheticDays(120);let price=20000;
   for(const bar of c){const open=price;price+=(random()-.5)*8;Object.assign(bar,{open,close:price,high:Math.max(open,price)+random()*2,low:Math.min(open,price)-random()*2});}
-  const report=await runSearch(c);assert.equal(report.status,'EXHAUSTED');assert.ok(report.accepted.length<3);
+  const report=await runSearch(c,{search:{mode:'confirmatory'}});assert.equal(report.status,'EXHAUSTED');assert.ok(report.accepted.length<3);
 });
 test('holdout lock failure prevents test execution',async()=>{
   let checkpoint;await assert.rejects(runSearch(syntheticDays(),searchOptions,{
     onCheckpoint:s=>{checkpoint=structuredClone(s);},onHoldoutOpen:()=>{throw new Error('holdout already exposed');},
   }),/holdout already exposed/);
   assert.ok(checkpoint.finalists.length>0);assert.equal(checkpoint.test.length,0);
+});
+
+
+test('development keeps holdout closed even when validation passes',async()=>{
+  let opened=false;
+  const r=await runSearch(syntheticDays(),{...searchOptions,search:{...searchOptions.search,mode:'development'}},{onHoldoutOpen:()=>{opened=true;}});
+  assert.ok(r.validationPassed>0);assert.ok(r.frozenCandidateIds.length>0);
+  assert.equal(opened,false);assert.equal(r.holdoutOpened,false);
+  assert.equal(r.finalists.length,0);assert.equal(r.accepted.length,0);
+  assert.equal(r.status,'DEVELOPMENT_COMPLETE');
+});
+test('retest v2 reclaims both directions; volume missing fails closed; gap cancels pending',()=>{
+  for(const direction of [1,-1]){
+    const c=bars(90).map(b=>({...b,time:b.time-3600000}));
+    c[75]={...c[75],open:100,high:103,low:99,close:102,volume:1000};
+    c[76]={...c[76],open:102,high:103,low:100.5,close:102.75,volume:500};
+    if(direction===-1)for(const b of c){const h=b.high;b.open=200-b.open;b.close=200-b.close;b.high=200-b.low;b.low=200-h;}
+    const base=buildCandidates('retest-v2').find(x=>x.params.window===72&&x.params.filter==='baseline');
+    assert.equal(createFactory(c,70).signal(base)(75).direction,0);
+    assert.equal(createFactory(c,70).signal(base)(76).direction,direction);
+    const volume={...base,params:{...base.params,filter:'volume'}};
+    assert.equal(createFactory(c,70).signal(volume)(76).direction,direction);
+    assert.equal(createFactory(c.map(b=>({...b,volume:0})),70).signal(volume)(76).direction,0);
+    const gap=c.map((b,i)=>({...b,time:b.time+(i>=76?300000:0)}));
+    assert.equal(createFactory(gap,70).signal(base)(76).direction,0);
+  }
+});
+test('every retest v2 filter is causal and grid is finite',()=>{
+  const candidates=buildCandidates('retest-v2');assert.equal(candidates.length,14);
+  assert.equal(new Set(candidates.map(c=>c.id)).size,14);
+  const c=bars(500),other=c.map((b,i)=>i>300?{...b,open:200,high:202,low:198,close:201,volume:1e8}:b);
+  const a=createFactory(c,200),b=createFactory(other,200);
+  for(const candidate of candidates)for(let i=0;i<=300;i++)assert.deepEqual(a.signal(candidate)(i),b.signal(candidate)(i));
 });

@@ -1,5 +1,5 @@
 // Standalone research execution. Bar timestamps are UTC milliseconds at bar OPEN.
-export const ENGINE_VERSION = 'nq-research-1';
+export const ENGINE_VERSION = 'nq-research-2';
 export const DEFAULT_EXECUTION = Object.freeze({
   pointValue: 2, tickSize: 0.25, commissionPerSide: 0.74,
   entrySlipTicks: 1, stopSlipTicks: 2, exitSlipTicks: 1,
