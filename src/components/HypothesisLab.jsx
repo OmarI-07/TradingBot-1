@@ -274,6 +274,31 @@ const HYPOTHESES = [
     },
   },
   {
+    id: 'h9_sweep_asian_atrfloor',
+    name: "H9 \u2014 PDH/PDL Sweep, Asian Session + ATR Floor",
+    description: "Built directly from the Combination Grid's (Section 7) top result: H2's sweep event, restricted to the Asian session, gated to ATR(14) > 33.33 \u2014 identical logic to what the grid tested, not a re-derivation. The grid's own result had two real concerns: only 13 trades (well under this Lab's usual 25-trade floor) and a p-value of 5.0% resting on a single permutation out of 20, the thinnest possible margin that test can produce. Also worth flagging: Asian session showed up as a standout on H2's own session breakdown once before, at similarly small sample size, and nothing built from that lead survived further testing. Tested fresh, on a wide month range, expecting it may well fail given both the trade count and the pattern-match to a prior false lead.",
+    makeSignal: (candles) => {
+      let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
+      return (i) => {
+        const c = candles[i]
+        const d = dayKey(c.time)
+        if (d !== curDay) {
+          if (curDay !== null) { pdh = curHigh; pdl = curLow }
+          curDay = d; curHigh = c.high; curLow = c.low
+        } else {
+          curHigh = Math.max(curHigh, c.high)
+          curLow  = Math.min(curLow, c.low)
+        }
+        if (pdh == null || pdl == null) return 'none'
+        if (getSession(c.time) !== 'Asian') return 'none'
+        if (calcATR(candles, i) <= 33.33) return 'none'
+        if (c.low  < pdl && c.close > pdl) return 'buy'
+        if (c.high > pdh && c.close < pdh) return 'sell'
+        return 'none'
+      }
+    },
+  },
+  {
     id: 'h2c_sweep_trend_aligned',
     name: 'H2c — PDH/PDL Sweep, Trend-Aligned',
     description: 'Identical event to H2, but only takes the trade when its direction agrees with the prevailing trend at that moment (5-bar % change of 20-SMA): bullish sweep only taken during an uptrend, bearish sweep only taken during a downtrend. Built from the Event Context Explorer\u0027s trend-steepness breakdown on H2\u0027s own event \u2014 steepest-downtrend quintile was significantly negative (CI cleared zero), steepest-uptrend quintile was the only positive mean in that table. Tests the direction-aware version of that finding, not a single arbitrary bucket.',
