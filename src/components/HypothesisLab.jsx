@@ -1002,11 +1002,11 @@ function silhouetteScore(vectors, assignments, k, sampleCap = 800) {
 }
 
 function findBestK(vectors, kMin, kMax) {
-  let best = { k: kMin, score: -Infinity, assignments: null }
+  let best = { k: kMin, score: -Infinity, assignments: null, centroids: null }
   for (let k = kMin; k <= kMax; k++) {
-    const { assignments } = kmeansCluster(vectors, k)
+    const { assignments, centroids } = kmeansCluster(vectors, k)
     const score = silhouetteScore(vectors, assignments, k)
-    if (score > best.score) best = { k, score, assignments }
+    if (score > best.score) best = { k, score, assignments, centroids }
   }
   return best
 }
@@ -1052,7 +1052,7 @@ function minePricePatterns(candles, opts = {}) {
   if (patterns.length < 50) return { error: 'Too few patterns extracted \u2014 need more months of data or a shorter lookback.' }
 
   const vectors = patterns.map((p) => p.pattern)
-  const { k, score: silhouette, assignments } = findBestK(vectors, kMin, kMax)
+  const { k, score: silhouette, assignments, centroids } = findBestK(vectors, kMin, kMax)
 
   const clusters = []
   for (let c = 0; c < k; c++) {
@@ -1077,7 +1077,24 @@ function minePricePatterns(candles, opts = {}) {
     }
     const evalResult = evaluateCluster(outcomes)
     if (!evalResult) continue
-    clusters.push({ clusterId: c, direction, patternCount: memberIdx.length, ...evalResult })
+
+    // Real, spread-out example windows \u2014 not just the first few chronologically,
+    // which could all cluster together in time and misrepresent the shape's
+    // actual variety. This is what lets a found cluster be visually inspected
+    // and understood, not just trusted as a statistic.
+    const exampleCount = Math.min(4, memberIdx.length)
+    const step = Math.max(1, Math.floor(memberIdx.length / exampleCount))
+    const examples = []
+    for (let e = 0; e < exampleCount; e++) {
+      const i = memberIdx[Math.min(e * step, memberIdx.length - 1)]
+      const endIdx = patterns[i].endIdx
+      examples.push({ endIdx, rawWindow: closes.slice(Math.max(0, endIdx - lookback), endIdx + 1) })
+    }
+
+    clusters.push({
+      clusterId: c, direction, patternCount: memberIdx.length, ...evalResult,
+      centroidPattern: centroids[c], examples,
+    })
   }
 
   clusters.sort((a, b) => b.expectancyR - a.expectancyR)
@@ -1101,6 +1118,105 @@ function runMiningPermutationTest(candles, opts = {}, numPermutations = 20) {
   permBests.sort((a, b) => a - b)
   return {
     ...real,
+    pValue: asGoodOrBetter / numPermutations,
+    numPermutations,
+    permMin: permBests[0],
+    permMedian: permBests[Math.floor(permBests.length / 2)],
+    permMax: permBests[permBests.length - 1],
+  }
+}
+
+// ── Combination grid: entry \u00d7 sizing \u00d7 session \u00d7 contextual gate ──
+// Runs base (ungated) entry rules through every combination of sizing mode,
+// session window, and contextual gate (the quantified "human features"
+// from the Context Explorer \u2014 trend alignment, ATR floor, small wick),
+// generated systematically rather than hand-picked. Deliberately uses the
+// BASE hypotheses (H1, H2, H3a, H5, H6, H7), not the already hand-gated
+// variants (H2c, H8b, etc.) \u2014 combining an already-gated rule with more
+// grid gates would double-apply and confuse the result.
+//
+// Picking the single best of many combinations is an aggressive
+// multiple-comparisons search \u2014 the whole 240-combination grid, not just
+// the winner, gets re-run on permuted data to check whether the real best
+// result is actually distinguishable from what this same greedy process
+// finds on noise. This runs automatically as one step, not a separate
+// button, since re-validating by hand every time defeats the purpose.
+
+function wrapWithGates(baseHyp, sessionName, contextualGate) {
+  return {
+    makeSignal: (candles) => {
+      const baseFn = baseHyp.makeSignal(candles)
+      const sma20 = contextualGate === 'trend' ? calcSMASeries(candles, 20) : null
+      return (i) => {
+        const action = baseFn(i)
+        if (action !== 'buy' && action !== 'sell') return action
+        if (sessionName !== 'none' && getSession(candles[i].time) !== sessionName) return 'none'
+        if (contextualGate === 'trend') {
+          let ts = 0
+          if (i >= 5 && sma20[i] != null && sma20[i - 5] != null && sma20[i - 5] !== 0) ts = (sma20[i] - sma20[i - 5]) / sma20[i - 5]
+          if (action === 'buy' && ts <= 0) return 'none'
+          if (action === 'sell' && ts >= 0) return 'none'
+        } else if (contextualGate === 'atrFloor') {
+          if (calcATR(candles, i) <= 33.33) return 'none'
+        } else if (contextualGate === 'smallWick') {
+          const c = candles[i]
+          const range = c.high - c.low
+          if (range <= 0) return 'none'
+          const wick = action === 'buy' ? (Math.min(c.open, c.close) - c.low) : (c.high - Math.max(c.open, c.close))
+          if (wick / range > 0.25) return 'none'
+        }
+        return action
+      }
+    },
+  }
+}
+
+const GRID_ENTRY_IDS = ['h1_orb', 'h2_pdh_pdl_sweep', 'h3a_momentum_any', 'h5_ema_pullback', 'h6_vwap_reversion', 'h7_amd_asian_london']
+const GRID_SIZING = ['riskAdjusted', 'fixed6']
+const GRID_SESSION = ['New York', 'Offhours', 'London', 'Asian', 'none']
+const GRID_CONTEXTUAL = ['trend', 'atrFloor', 'smallWick', 'none']
+
+function runFullGrid(candles) {
+  const results = []
+  for (const entryId of GRID_ENTRY_IDS) {
+    const baseHyp = HYPOTHESES.find((h) => h.id === entryId)
+    if (!baseHyp) continue
+    for (const sizing of GRID_SIZING) {
+      for (const session of GRID_SESSION) {
+        for (const contextual of GRID_CONTEXTUAL) {
+          const wrapped = wrapWithGates(baseHyp, session, contextual)
+          const fn = wrapped.makeSignal(candles)
+          const opts = sizing === 'fixed6' ? { fixedContracts: 6 } : {}
+          const { trades } = runEngine(candles, fn, opts)
+          if (trades.length < 10) continue
+          const stats = summarize(trades)
+          results.push({ entryId, sizing, session, contextual, ...stats })
+        }
+      }
+    }
+  }
+  results.sort((a, b) => b.expectancyR - a.expectancyR)
+  return results
+}
+
+function runGridPermutationTest(candles, numPermutations = 20) {
+  const realResults = runFullGrid(candles)
+  const realBest = realResults[0] || null
+  if (!realBest) return { results: realResults, best: null, permutationSkipped: true }
+
+  let asGoodOrBetter = 0
+  const permBests = []
+  for (let p = 0; p < numPermutations; p++) {
+    const permuted = permuteBars(candles, 0)
+    const permResults = runFullGrid(permuted)
+    const bestR = (permResults[0] && permResults[0].expectancyR) ?? -Infinity
+    permBests.push(bestR)
+    if (bestR >= realBest.expectancyR) asGoodOrBetter++
+  }
+  permBests.sort((a, b) => a - b)
+  return {
+    results: realResults,
+    best: realBest,
     pValue: asGoodOrBetter / numPermutations,
     numPermutations,
     permMin: permBests[0],
@@ -1562,6 +1678,22 @@ function JointBucketTable({ buckets }) {
   )
 }
 
+function Sparkline({ values, width = 110, height = 32, color = 'var(--blue)' }) {
+  if (!values || values.length < 2) return null
+  const min = Math.min(...values), max = Math.max(...values)
+  const range = max - min || 1
+  const points = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * width
+    const y = height - ((v - min) / range) * (height - 4) - 2
+    return `${x},${y}`
+  }).join(' ')
+  return (
+    <svg width={width} height={height} style={{ display: 'block' }}>
+      <polyline points={points} fill="none" stroke={color} strokeWidth="1.5" />
+    </svg>
+  )
+}
+
 function GapWarning({ gaps }) {
   if (!gaps.length) return null
   return (
@@ -1626,6 +1758,12 @@ export default function HypothesisLab() {
   const [pmLoadMsg, setPmLoadMsg]   = useState('')
   const [pmError, setPmError]       = useState('')
   const [pmResults, setPmResults]   = useState(null)
+
+  const [gridMonths, setGridMonths]     = useState([])
+  const [gridRunning, setGridRunning]   = useState(false)
+  const [gridLoadMsg, setGridLoadMsg]   = useState('')
+  const [gridError, setGridError]       = useState('')
+  const [gridResults, setGridResults]   = useState(null)
 
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
@@ -1812,6 +1950,55 @@ export default function HypothesisLab() {
     } finally {
       setPtRunning(false)
       setPtLoadMsg('')
+    }
+  }
+
+  async function runGridUI() {
+    if (!gridMonths.length) { setGridError('Select at least one month.'); return }
+    setGridError('')
+    setGridRunning(true)
+    setGridResults(null)
+    try {
+      setGridLoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(SYMBOL, '5min', [...gridMonths].sort((a, b) => a.key.localeCompare(b.key)))
+
+      setGridLoadMsg('Running real grid (240 combinations)\u2026')
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      const realResults = runFullGrid(candles)
+      const realBest = realResults[0] || null
+
+      if (!realBest) {
+        setGridResults({ results: realResults, best: null, permutationSkipped: true })
+        return
+      }
+
+      const numPermutations = 20
+      let asGoodOrBetter = 0
+      const permBests = []
+      for (let p = 0; p < numPermutations; p++) {
+        setGridLoadMsg(`Running permutation ${p + 1} of ${numPermutations} (full grid each time)\u2026`)
+        await new Promise((resolve) => setTimeout(resolve, 0)) // yield so the UI stays responsive across this multi-minute loop
+        const permuted = permuteBars(candles, 0)
+        const permResults = runFullGrid(permuted)
+        const bestR = (permResults[0] && permResults[0].expectancyR) ?? -Infinity
+        permBests.push(bestR)
+        if (bestR >= realBest.expectancyR) asGoodOrBetter++
+      }
+      permBests.sort((a, b) => a - b)
+      setGridResults({
+        results: realResults,
+        best: realBest,
+        pValue: asGoodOrBetter / numPermutations,
+        numPermutations,
+        permMin: permBests[0],
+        permMedian: permBests[Math.floor(permBests.length / 2)],
+        permMax: permBests[permBests.length - 1],
+      })
+    } catch (e) {
+      setGridError(e.message)
+    } finally {
+      setGridRunning(false)
+      setGridLoadMsg('')
     }
   }
 
@@ -2305,7 +2492,7 @@ export default function HypothesisLab() {
             </>
           )}
 
-          <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+          <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse', marginBottom: 16 }}>
             <thead>
               <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
                 <th style={{ textAlign: 'left', padding: '3px 6px' }}>Cluster</th>
@@ -2333,6 +2520,114 @@ export default function HypothesisLab() {
                   </tr>
                 )
               })}
+            </tbody>
+          </table>
+
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 8 }}>
+            What each cluster actually looks like
+          </div>
+          {pmResults.clusters.map((c) => (
+            <div key={c.clusterId} style={{ marginBottom: 16, paddingBottom: 12, borderBottom: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 4 }}>
+                Cluster #{c.clusterId} ({c.direction}) \u2014 canonical shape:
+              </div>
+              <Sparkline values={c.centroidPattern} color="var(--blue)" />
+              <div style={{ fontSize: 11, color: 'var(--text-dim)', margin: '8px 0 4px' }}>
+                {c.examples.length} real historical occurrences, spread across the dataset:
+              </div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                {c.examples.map((ex, i) => (
+                  <Sparkline key={i} values={ex.rawWindow} color="var(--text-muted)" />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">7. Combination Grid (Entry \u00d7 Sizing \u00d7 Session \u00d7 Feature)</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          6 base entry rules (H1, H2, H3a, H5, H6, H7 \u2014 ungated) \u00d7 2 sizing modes (risk-adjusted,
+          fixed 6) \u00d7 5 session windows \u00d7 4 contextual gates (trend alignment, ATR floor, small wick,
+          none) = 240 combinations. One click runs the real grid, then automatically re-runs the entire
+          240-combination grid on 20 permuted (scrambled) versions of the same data and compares the real
+          best combination against that distribution \u2014 no separate step required. Picking the single
+          best of 240 is an aggressive multiple-comparisons search; this is what makes that search honest.
+          Takes roughly 1\u20133 minutes \u2014 progress shown below, no need to keep clicking.
+        </p>
+      </div>
+
+      <MonthPicker label="Grid months" selected={gridMonths} onToggle={toggle(setGridMonths)} />
+
+      {gridError && <div className="error-box">{gridError}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runGridUI} disabled={gridRunning} style={{ flex: 1, padding: '11px' }}>
+          {gridRunning ? `\u23f3 ${gridLoadMsg}` : '\u25b6 Run full grid + validation'}
+        </button>
+      </div>
+
+      {gridResults && !gridResults.best && (
+        <div className="error-box">No combination produced at least 10 trades on the selected months \u2014 try a wider month range.</div>
+      )}
+
+      {gridResults && gridResults.best && (
+        <div className="card">
+          <div className="card-title">Best Combination</div>
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            <strong>{gridResults.best.entryId}</strong> \u00d7 {gridResults.best.sizing} \u00d7 {gridResults.best.session} \u00d7 {gridResults.best.contextual}
+          </p>
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            {gridResults.best.trades} trades, {gridResults.best.winRate}% win rate, expectancy{' '}
+            <strong>{gridResults.best.expectancyR >= 0 ? '+' : ''}{gridResults.best.expectancyR}R</strong>,{' '}
+            P&amp;L {gridResults.best.totalDollar >= 0 ? '+' : ''}${gridResults.best.totalDollar}
+          </p>
+
+          {gridResults.pValue != null && (
+            <>
+              <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                color: gridResults.pValue <= 0.01 ? 'var(--green)' : gridResults.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                p = {(gridResults.pValue * 100).toFixed(1)}%
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+                {(gridResults.pValue * 100).toFixed(1)}% of {gridResults.numPermutations} full re-runs of the entire
+                240-combination grid on scrambled data matched or beat this real best result.{' '}
+                {gridResults.pValue <= 0.05
+                  ? 'Clears or is close to the bar \u2014 still needs its own Train/Validate/Test and walk-forward as a standalone hypothesis before trusting it further.'
+                  : 'Above 5% \u2014 picking the best of 240 finds results this good on pure noise too often for this one to be trustworthy on its own.'}
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 16 }}>
+                Permutation best-of-grid distribution: min {gridResults.permMin.toFixed(3)}R, median {gridResults.permMedian.toFixed(3)}R, max {gridResults.permMax.toFixed(3)}R
+              </p>
+            </>
+          )}
+
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4 }}>Top 15 combinations</div>
+          <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                <th style={{ textAlign: 'left', padding: '3px 6px' }}>Entry</th>
+                <th style={{ padding: '3px 6px' }}>Sizing</th>
+                <th style={{ padding: '3px 6px' }}>Session</th>
+                <th style={{ padding: '3px 6px' }}>Gate</th>
+                <th style={{ padding: '3px 6px' }}>n</th>
+                <th style={{ padding: '3px 6px' }}>Expectancy</th>
+                <th style={{ padding: '3px 6px' }}>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {gridResults.results.slice(0, 15).map((r, i) => (
+                <tr key={i}>
+                  <td style={{ padding: '3px 6px' }}>{r.entryId}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.sizing}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.session}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.contextual}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.trades}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.expectancyR >= 0 ? '+' : ''}{r.expectancyR}R</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right', color: r.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{r.totalDollar >= 0 ? '+' : ''}${r.totalDollar}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
