@@ -1259,6 +1259,90 @@ function runGridPermutationTest(candles, numPermutations = 20) {
   }
 }
 
+// ── H9 Neighborhood Grid ──────────────────────────────────────────
+// A small, fixed, pre-declared grid anchored specifically around H9's own
+// structure (ATR threshold, session scope, entry direction) \u2014 not a
+// search across unrelated hypotheses. Answers the actual question at
+// stake: does H9 sit inside a broad region of positive expectancy, or
+// right at a single lucky point that collapses the moment any dimension
+// shifts. The whole 42-combination neighborhood, not just the winner,
+// gets re-run on permuted data \u2014 exploring "combinations around H9" is
+// still search, and still needs the same validation discipline as
+// Section 7's larger grid.
+
+const H9_ATR_VALUES = [20, 25, 30, 33.33, 40, 50, 60]
+const H9_SESSION_SCOPES = ['Asian-full', 'Asian-core']
+const H9_DIRECTIONS = ['both', 'long-only', 'short-only']
+
+function makeH9VariantSignal(candles, opts) {
+  const { atrThreshold, sessionScope, direction } = opts
+  let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
+  return (i) => {
+    const c = candles[i]
+    const d = dayKey(c.time)
+    if (d !== curDay) {
+      if (curDay !== null) { pdh = curHigh; pdl = curLow }
+      curDay = d; curHigh = c.high; curLow = c.low
+    } else {
+      curHigh = Math.max(curHigh, c.high)
+      curLow  = Math.min(curLow, c.low)
+    }
+    if (pdh == null || pdl == null) return 'none'
+
+    const h = utcHour(c.time)
+    const inSession = sessionScope === 'Asian-full' ? getSession(c.time) === 'Asian' : (h === 0 || h === 1 || h === 2)
+    if (!inSession) return 'none'
+    if (calcATR(candles, i) <= atrThreshold) return 'none'
+
+    if (c.low  < pdl && c.close > pdl) { if (direction === 'short-only') return 'none'; return 'buy' }
+    if (c.high > pdh && c.close < pdh) { if (direction === 'long-only') return 'none'; return 'sell' }
+    return 'none'
+  }
+}
+
+function runH9NeighborhoodGrid(candles) {
+  const results = []
+  for (const atrThreshold of H9_ATR_VALUES) {
+    for (const sessionScope of H9_SESSION_SCOPES) {
+      for (const direction of H9_DIRECTIONS) {
+        const fn = makeH9VariantSignal(candles, { atrThreshold, sessionScope, direction })
+        const { trades } = runEngine(candles, fn)
+        if (trades.length < 5) continue
+        const stats = summarize(trades)
+        results.push({ atrThreshold, sessionScope, direction, ...stats })
+      }
+    }
+  }
+  results.sort((a, b) => b.expectancyR - a.expectancyR)
+  return results
+}
+
+function runH9GridPermutationTest(candles, numPermutations = 100) {
+  const realResults = runH9NeighborhoodGrid(candles)
+  const realBest = realResults[0] || null
+  if (!realBest) return { results: realResults, best: null, permutationSkipped: true }
+
+  let asGoodOrBetter = 0
+  const permBests = []
+  for (let p = 0; p < numPermutations; p++) {
+    const permuted = permuteBars(candles, 0)
+    const permResults = runH9NeighborhoodGrid(permuted)
+    const bestR = (permResults[0] && permResults[0].expectancyR) ?? -Infinity
+    permBests.push(bestR)
+    if (bestR >= realBest.expectancyR) asGoodOrBetter++
+  }
+  permBests.sort((a, b) => a - b)
+  return {
+    results: realResults,
+    best: realBest,
+    pValue: asGoodOrBetter / numPermutations,
+    numPermutations,
+    permMin: permBests[0],
+    permMedian: permBests[Math.floor(permBests.length / 2)],
+    permMax: permBests[permBests.length - 1],
+  }
+}
+
 // ── Gap magnitude on Opening Range Breakout ───────────────────────
 // A second, separate contextual-feature study \u2014 not another cut of the
 // PDH/PDL sweep event, a different event entirely (same one H1 already
@@ -1799,6 +1883,12 @@ export default function HypothesisLab() {
   const [gridError, setGridError]       = useState('')
   const [gridResults, setGridResults]   = useState(null)
 
+  const [h9Months, setH9Months]     = useState([])
+  const [h9Running, setH9Running]   = useState(false)
+  const [h9LoadMsg, setH9LoadMsg]   = useState('')
+  const [h9Error, setH9Error]       = useState('')
+  const [h9Results, setH9Results]   = useState(null)
+
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
   function toggle(setBucket) {
@@ -1984,6 +2074,55 @@ export default function HypothesisLab() {
     } finally {
       setPtRunning(false)
       setPtLoadMsg('')
+    }
+  }
+
+  async function runH9GridUI() {
+    if (!h9Months.length) { setH9Error('Select at least one month.'); return }
+    setH9Error('')
+    setH9Running(true)
+    setH9Results(null)
+    try {
+      setH9LoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(SYMBOL, '5min', [...h9Months].sort((a, b) => a.key.localeCompare(b.key)))
+
+      setH9LoadMsg('Running real 42-combination neighborhood\u2026')
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      const realResults = runH9NeighborhoodGrid(candles)
+      const realBest = realResults[0] || null
+
+      if (!realBest) {
+        setH9Results({ results: realResults, best: null, permutationSkipped: true })
+        return
+      }
+
+      const numPermutations = 100
+      let asGoodOrBetter = 0
+      const permBests = []
+      for (let p = 0; p < numPermutations; p++) {
+        setH9LoadMsg(`Running permutation ${p + 1} of ${numPermutations}\u2026`)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const permuted = permuteBars(candles, 0)
+        const permResults = runH9NeighborhoodGrid(permuted)
+        const bestR = (permResults[0] && permResults[0].expectancyR) ?? -Infinity
+        permBests.push(bestR)
+        if (bestR >= realBest.expectancyR) asGoodOrBetter++
+      }
+      permBests.sort((a, b) => a - b)
+      setH9Results({
+        results: realResults,
+        best: realBest,
+        pValue: asGoodOrBetter / numPermutations,
+        numPermutations,
+        permMin: permBests[0],
+        permMedian: permBests[Math.floor(permBests.length / 2)],
+        permMax: permBests[permBests.length - 1],
+      })
+    } catch (e) {
+      setH9Error(e.message)
+    } finally {
+      setH9Running(false)
+      setH9LoadMsg('')
     }
   }
 
@@ -2642,6 +2781,89 @@ export default function HypothesisLab() {
                   <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.sizing}</td>
                   <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.session}</td>
                   <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.contextual}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.trades}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.expectancyR >= 0 ? '+' : ''}{r.expectancyR}R</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right', color: r.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{r.totalDollar >= 0 ? '+' : ''}${r.totalDollar}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">8. H9 Neighborhood Grid</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          A small, fixed grid anchored on H9\u2019s own structure: ATR threshold [20, 25, 30, 33.33, 40, 50,
+          60] \u00d7 session scope [full Asian window, a narrower 3-hour core] \u00d7 direction [both,
+          long-only, short-only] = 42 combinations. Answers whether H9 sits inside a broad region of positive
+          expectancy or right at a single point that collapses the moment anything shifts. The whole
+          neighborhood \u2014 not just the winner \u2014 gets automatically re-run on 100 permuted datasets
+          (higher resolution than Section 7\u2019s grid, since this one is much smaller and cheaper to
+          re-run). One click, no second step. Should take under a minute.
+        </p>
+      </div>
+
+      <MonthPicker label="H9 grid months" selected={h9Months} onToggle={toggle(setH9Months)} />
+
+      {h9Error && <div className="error-box">{h9Error}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runH9GridUI} disabled={h9Running} style={{ flex: 1, padding: '11px' }}>
+          {h9Running ? `\u23f3 ${h9LoadMsg}` : '\u25b6 Run H9 neighborhood grid + validation'}
+        </button>
+      </div>
+
+      {h9Results && !h9Results.best && (
+        <div className="error-box">No combination in this neighborhood produced at least 5 trades \u2014 try a wider month range.</div>
+      )}
+
+      {h9Results && h9Results.best && (
+        <div className="card">
+          <div className="card-title">Best in Neighborhood</div>
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            ATR &gt; <strong>{h9Results.best.atrThreshold}</strong> \u00d7 {h9Results.best.sessionScope} \u00d7 {h9Results.best.direction}
+          </p>
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            {h9Results.best.trades} trades, {h9Results.best.winRate}% win rate, expectancy{' '}
+            <strong>{h9Results.best.expectancyR >= 0 ? '+' : ''}{h9Results.best.expectancyR}R</strong>,{' '}
+            P&amp;L {h9Results.best.totalDollar >= 0 ? '+' : ''}${h9Results.best.totalDollar}
+          </p>
+
+          {h9Results.pValue != null && (
+            <>
+              <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                color: h9Results.pValue <= 0.01 ? 'var(--green)' : h9Results.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                p = {(h9Results.pValue * 100).toFixed(1)}%
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+                {(h9Results.pValue * 100).toFixed(1)}% of {h9Results.numPermutations} full re-runs of this
+                42-combination neighborhood on scrambled data matched or beat this real best result.
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 16 }}>
+                Permutation best-of-neighborhood distribution: min {h9Results.permMin.toFixed(3)}R, median {h9Results.permMedian.toFixed(3)}R, max {h9Results.permMax.toFixed(3)}R
+              </p>
+            </>
+          )}
+
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4 }}>All 42 combinations</div>
+          <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                <th style={{ textAlign: 'left', padding: '3px 6px' }}>ATR &gt;</th>
+                <th style={{ padding: '3px 6px' }}>Session</th>
+                <th style={{ padding: '3px 6px' }}>Direction</th>
+                <th style={{ padding: '3px 6px' }}>n</th>
+                <th style={{ padding: '3px 6px' }}>Expectancy</th>
+                <th style={{ padding: '3px 6px' }}>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {h9Results.results.map((r, i) => (
+                <tr key={i}>
+                  <td style={{ padding: '3px 6px' }}>{r.atrThreshold}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.sessionScope}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.direction}</td>
                   <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.trades}</td>
                   <td style={{ padding: '3px 6px', textAlign: 'right' }}>{r.expectancyR >= 0 ? '+' : ''}{r.expectancyR}R</td>
                   <td style={{ padding: '3px 6px', textAlign: 'right', color: r.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{r.totalDollar >= 0 ? '+' : ''}${r.totalDollar}</td>
