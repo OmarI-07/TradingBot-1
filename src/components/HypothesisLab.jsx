@@ -1666,6 +1666,50 @@ async function runPromotedShapeSplit(promoted, months) {
   return summarize(trades)
 }
 
+// Combo version: fires whichever target shape's OWN direction matches,
+// selected by COHESION (decided before any trading stats are consulted),
+// not by cherry-picking whichever shapes scored best \u2014 that selection
+// order is the whole point, since picking winners by expectancy first
+// is the exact multiple-comparisons trap this Lab exists to catch.
+function makeComboShapeSignal(nqCandles, esCandles, allCentroids, targetShapes, opts = {}) {
+  const lookback = opts.lookback ?? 24
+  const nPips = opts.nPips ?? 5
+  const esByTime = new Map(esCandles.map((c) => [c.time, c]))
+  const alignedIdx = [], spreadVals = []
+  for (let i = 0; i < nqCandles.length; i++) {
+    const es = esByTime.get(nqCandles[i].time)
+    if (es) { alignedIdx.push(i); spreadVals.push(Math.log(nqCandles[i].close) - Math.log(es.close)) }
+  }
+  const origToPos = new Map(alignedIdx.map((origI, pos) => [origI, pos]))
+  return (i) => {
+    const pos = origToPos.get(i)
+    if (pos == null || pos < lookback) return 'none'
+    const window = spreadVals.slice(pos - lookback, pos + 1)
+    const pipIdx = findPIPs(window, nPips)
+    if (pipIdx.length < nPips) return 'none'
+    const pipVals = pipIdx.map((idx) => window[idx])
+    const mean = pipVals.reduce((a, b) => a + b, 0) / pipVals.length
+    const variance = pipVals.reduce((a, b) => a + (b - mean) ** 2, 0) / pipVals.length
+    const std = Math.sqrt(variance)
+    if (std === 0) return 'none'
+    const normalized = pipVals.map((v) => (v - mean) / std)
+    const nearest = nearestCentroid(normalized, allCentroids)
+    const match = targetShapes.find((s) => s.clusterId === nearest)
+    if (!match) return 'none'
+    return match.direction === 'bullish' ? 'buy' : 'sell'
+  }
+}
+
+async function runComboShapeSplit(combo, months) {
+  if (!months.length) return null
+  const sorted = [...months].sort((a, b) => a.key.localeCompare(b.key))
+  const nq = await fetchSelectedMonths(SYMBOL, '5min', sorted)
+  const es = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', sorted)
+  const fn = makeComboShapeSignal(nq, es, combo.allCentroids, combo.targetShapes)
+  const { trades } = runEngine(nq, fn)
+  return summarize(trades)
+}
+
 // ── H9 Neighborhood Grid ──────────────────────────────────────────
 // A small, fixed, pre-declared grid anchored specifically around H9's own
 // structure (ATR threshold, session scope, entry direction) \u2014 not a
@@ -2317,6 +2361,15 @@ export default function HypothesisLab() {
   const [psError, setPsError]         = useState('')
   const [psResults, setPsResults]     = useState(null) // { train, validate, test }
 
+  const [promotedCombo, setPromotedCombo] = useState(null) // { allCentroids, targetShapes, label }
+  const [pcTrainMonths, setPcTrainMonths]     = useState([])
+  const [pcValidateMonths, setPcValidateMonths] = useState([])
+  const [pcTestMonths, setPcTestMonths]       = useState([])
+  const [pcRunning, setPcRunning]     = useState(false)
+  const [pcLoadMsg, setPcLoadMsg]     = useState('')
+  const [pcError, setPcError]         = useState('')
+  const [pcResults, setPcResults]     = useState(null)
+
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
   function toggle(setBucket) {
@@ -2547,6 +2600,55 @@ export default function HypothesisLab() {
     } finally {
       setPsRunning(false)
       setPsLoadMsg('')
+    }
+  }
+
+  function promoteCohesionTop3() {
+    if (!imResults || !imResults.clusters) return
+    // Selection by COHESION only \u2014 imResults.clusters is already sorted
+    // tightest-first by mineIntermarketPatterns itself, decided before any
+    // trading stats are consulted here. Only skip a shape if it has no
+    // tradable direction at all (too little forward-return data).
+    const eligible = imResults.clusters.filter((c) => c.direction != null)
+    const top3 = eligible.slice(0, 3)
+    if (top3.length === 0) { setPcError('No shapes with enough data to trade were found.'); return }
+    const allCentroids = imResults.clusters
+      .slice()
+      .sort((a, b) => a.clusterId - b.clusterId)
+      .map((c) => c.centroidPattern)
+    const targetShapes = top3.map((c) => ({ clusterId: c.clusterId, direction: c.direction }))
+    setPromotedCombo({
+      allCentroids, targetShapes,
+      label: `Top ${top3.length} by cohesion (Shapes ${top3.map((c) => '#' + c.clusterId).join(', ')})`,
+    })
+    setPcResults(null)
+    setPcError('')
+  }
+
+  async function runComboUI() {
+    if (!promotedCombo) return
+    if (!pcTrainMonths.length) { setPcError('Select at least one Train month.'); return }
+    setPcError('')
+    setPcRunning(true)
+    setPcResults(null)
+    try {
+      setPcLoadMsg('Testing Train\u2026')
+      const train = await runComboShapeSplit(promotedCombo, pcTrainMonths)
+      let validate = null, test = null
+      if (pcValidateMonths.length) {
+        setPcLoadMsg('Testing Validate\u2026')
+        validate = await runComboShapeSplit(promotedCombo, pcValidateMonths)
+      }
+      if (pcTestMonths.length) {
+        setPcLoadMsg('Testing Test\u2026')
+        test = await runComboShapeSplit(promotedCombo, pcTestMonths)
+      }
+      setPcResults({ train, validate, test })
+    } catch (e) {
+      setPcError(e.message)
+    } finally {
+      setPcRunning(false)
+      setPcLoadMsg('')
     }
   }
 
@@ -3570,6 +3672,77 @@ export default function HypothesisLab() {
               <tbody>
                 {['train', 'validate', 'test'].map((k) => {
                   const s = psResults[k]
+                  if (!s) return (
+                    <tr key={k}><td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td><td colSpan={4} style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>not run</td></tr>
+                  )
+                  return (
+                    <tr key={k}>
+                      <td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.trades}</td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.winRate}% <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>[{s.winRateLower}\u2013{s.winRateUpper}]</span></td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.expectancyR >= 0 ? '+' : ''}{s.expectancyR}R</td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right', color: s.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{s.totalDollar >= 0 ? '+' : ''}${s.totalDollar}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      <div className="card">
+        <div className="row" style={{ marginBottom: 8 }}>
+          <button
+            onClick={promoteCohesionTop3}
+            disabled={!imResults || !imResults.clusters}
+            style={{ padding: '8px 12px', borderRadius: 6, fontSize: 12, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text-muted)', cursor: 'pointer' }}
+          >
+            Promote Top 3 by Cohesion \u2192 Combo Hypothesis
+          </button>
+        </div>
+        <p style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.5 }}>
+          Selected by cohesion alone (the 3 tightest, most consistently-repeating shapes from the current
+          run), decided before any trading stats are consulted \u2014 not the best-looking-by-expectancy
+          shapes. Picking winners by score first, then combining them, is the exact multiple-comparisons
+          trap this Lab exists to catch; this avoids it by fixing the selection rule in advance.
+        </p>
+      </div>
+
+      {promotedCombo && (
+        <div className="card">
+          <div className="card-title">Combo: {promotedCombo.label}</div>
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6, marginBottom: 10 }}>
+            Fires whichever target shape\u2019s own direction matches \u2014 an OR-rule across the 3
+            cohesion-selected shapes, each still using the exact live-matching logic already verified to
+            reproduce the offline clustering\u2019s own assignments 100% of the time.
+          </p>
+          <MonthPicker label="Combo Train months" selected={pcTrainMonths} onToggle={toggle(setPcTrainMonths)} />
+          <MonthPicker label="Combo Validate months" selected={pcValidateMonths} onToggle={toggle(setPcValidateMonths)} />
+          <MonthPicker label="Combo Test months" selected={pcTestMonths} onToggle={toggle(setPcTestMonths)} />
+
+          {pcError && <div className="error-box">{pcError}</div>}
+
+          <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+            <button className="btn-green" onClick={runComboUI} disabled={pcRunning} style={{ flex: 1, padding: '11px' }}>
+              {pcRunning ? `\u23f3 ${pcLoadMsg}` : '\u25b6 Run combo Train/Validate/Test'}
+            </button>
+          </div>
+
+          {pcResults && (
+            <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                  <th style={{ textAlign: 'left', padding: '6px 8px' }}>Bucket</th>
+                  <th style={{ padding: '6px 8px' }}>Trades</th>
+                  <th style={{ padding: '6px 8px' }}>Win%</th>
+                  <th style={{ padding: '6px 8px' }}>Expectancy</th>
+                  <th style={{ padding: '6px 8px' }}>P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {['train', 'validate', 'test'].map((k) => {
+                  const s = pcResults[k]
                   if (!s) return (
                     <tr key={k}><td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td><td colSpan={4} style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>not run</td></tr>
                   )
