@@ -1355,7 +1355,40 @@ function mineIntermarketPatterns(nqCandles, esCandles, opts = {}) {
   }
 
   clusters.sort((a, b) => a.cohesion - b.cohesion)
-  return { totalPatterns: patterns.length, alignedBars: nq.length, k: kFixed, clusters }
+  const withTradingEval = clusters.filter((c) => c.expectancyR != null)
+  const bestByExpectancy = [...withTradingEval].sort((a, b) => b.expectancyR - a.expectancyR)[0] || null
+  return { totalPatterns: patterns.length, alignedBars: nq.length, k: kFixed, clusters, bestByExpectancy }
+}
+
+// Permutes NQ only (timestamps preserved) while keeping ES's real sequence
+// fixed, then re-runs the entire mining pipeline \u2014 tests specifically
+// whether the REAL NQ-ES relationship matters, versus any random NQ
+// sequence with the same statistical shape related to the real ES data.
+// Reuses permuteBars unchanged; same 20-permutation budget as Section 6,
+// since the per-run cost (clustering dominates) is comparable.
+function runIntermarketPermutationTest(nqCandles, esCandles, opts = {}, numPermutations = 20) {
+  const real = mineIntermarketPatterns(nqCandles, esCandles, opts)
+  if (real.error || !real.bestByExpectancy) return { ...real, permutationSkipped: true }
+
+  const realBestR = real.bestByExpectancy.expectancyR
+  let asGoodOrBetter = 0
+  const permBests = []
+  for (let p = 0; p < numPermutations; p++) {
+    const permutedNQ = permuteBars(nqCandles, 0)
+    const result = mineIntermarketPatterns(permutedNQ, esCandles, opts)
+    const bestR = (result.bestByExpectancy && result.bestByExpectancy.expectancyR) ?? -Infinity
+    permBests.push(bestR)
+    if (bestR >= realBestR) asGoodOrBetter++
+  }
+  permBests.sort((a, b) => a - b)
+  return {
+    ...real,
+    pValue: asGoodOrBetter / numPermutations,
+    numPermutations,
+    permMin: permBests[0],
+    permMedian: permBests[Math.floor(permBests.length / 2)],
+    permMax: permBests[permBests.length - 1],
+  }
 }
 
 // ── SMC Liquidity Sweep + FVG Continuation (Dynamic Profit Hold) ────
@@ -2456,8 +2489,35 @@ export default function HypothesisLab() {
       const esCandles = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', [...imMonths].sort((a, b) => a.key.localeCompare(b.key)))
       setImLoadMsg('Aligning, computing spread, mining shapes\u2026')
       await new Promise((resolve) => setTimeout(resolve, 30))
-      const result = mineIntermarketPatterns(nqCandles, esCandles)
-      setImResults(result)
+      const real = mineIntermarketPatterns(nqCandles, esCandles)
+
+      if (real.error || !real.bestByExpectancy) {
+        setImResults({ ...real, permutationSkipped: true })
+        return
+      }
+
+      const numPermutations = 20
+      const realBestR = real.bestByExpectancy.expectancyR
+      let asGoodOrBetter = 0
+      const permBests = []
+      for (let p = 0; p < numPermutations; p++) {
+        setImLoadMsg(`Running permutation ${p + 1} of ${numPermutations}\u2026`)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const permutedNQ = permuteBars(nqCandles, 0)
+        const permResult = mineIntermarketPatterns(permutedNQ, esCandles)
+        const bestR = (permResult.bestByExpectancy && permResult.bestByExpectancy.expectancyR) ?? -Infinity
+        permBests.push(bestR)
+        if (bestR >= realBestR) asGoodOrBetter++
+      }
+      permBests.sort((a, b) => a - b)
+      setImResults({
+        ...real,
+        pValue: asGoodOrBetter / numPermutations,
+        numPermutations,
+        permMin: permBests[0],
+        permMedian: permBests[Math.floor(permBests.length / 2)],
+        permMax: permBests[permBests.length - 1],
+      })
     } catch (e) {
       setImError(e.message)
     } finally {
@@ -3294,6 +3354,33 @@ export default function HypothesisLab() {
       {imResults && !imResults.error && (
         <div className="card">
           <div className="card-title">Discovered Spread Shapes ({imResults.alignedBars} aligned bars \u2192 {imResults.totalPatterns} patterns \u2192 {imResults.clusters.length} shapes)</div>
+
+          {imResults.pValue != null && (
+            <div style={{ marginBottom: 18, paddingBottom: 14, borderBottom: '2px solid var(--border)' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                Trading Validation \u2014 Best Shape by Expectancy
+              </div>
+              <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+                Permutes NQ only (real ES sequence kept fixed) and re-runs the entire mining pipeline \u2014
+                tests whether the real NQ-ES relationship matters, or whether any similarly-shaped random
+                NQ sequence does just as well against the real ES data.
+              </p>
+              <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                color: imResults.pValue <= 0.01 ? 'var(--green)' : imResults.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                p = {(imResults.pValue * 100).toFixed(1)}%
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+                {(imResults.pValue * 100).toFixed(1)}% of {imResults.numPermutations} full re-runs with a
+                permuted NQ sequence matched or beat this real result.{' '}
+                {imResults.pValue <= 0.05
+                  ? 'Clears or is close to the bar \u2014 still needs Train/Validate/Test and walk-forward as its own hypothesis before trusting it further.'
+                  : 'Above 5% \u2014 not statistically distinguishable from what this search finds when the real NQ-ES relationship is destroyed.'}
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+                Permutation best-shape distribution: min {imResults.permMin.toFixed(3)}R, median {imResults.permMedian.toFixed(3)}R, max {imResults.permMax.toFixed(3)}R
+              </p>
+            </div>
+          )}
 
           {imResults.clusters.map((c) => (
             <div key={c.clusterId} style={{ marginBottom: 18, paddingBottom: 14, borderBottom: '1px solid var(--border)' }}>
