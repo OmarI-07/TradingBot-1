@@ -1259,6 +1259,324 @@ function runGridPermutationTest(candles, numPermutations = 20) {
   }
 }
 
+// ── Intermarket Pattern Miner (NQ vs. ES) ─────────────────────────
+// The generic mining engine (findPIPs/extractPatterns/kmeansCluster),
+// completely unchanged, pointed at a genuinely new series instead of
+// NQ's own price \u2014 the log-ratio spread between NQ and ES, i.e. whether
+// NQ is outperforming or underperforming ES at each point. This is a
+// relationship between two instruments, not a shape in one instrument's
+// own price \u2014 something the two prior mining runs on NQ price alone
+// (p=40%, p=85%) structurally could not have found, however thoroughly
+// they searched.
+//
+// PLACEHOLDER: 'ES' below is a guess at Massive's exact ticker string.
+// Check the [TICKER CHECK] console log (added to the Train fetch) against
+// your actual Massive dashboard/FUTURES_SYMBOLS list and correct this if
+// the real ticker differs (e.g. 'ES1!', 'ESZ25', etc.).
+const INTERMARKET_SYMBOL = 'ES'
+
+function alignByTimestamp(candlesA, candlesB) {
+  const mapB = new Map(candlesB.map((c) => [c.time, c]))
+  const alignedA = [], alignedB = []
+  for (const c of candlesA) {
+    const match = mapB.get(c.time)
+    if (match) { alignedA.push(c); alignedB.push(match) }
+  }
+  return { alignedA, alignedB }
+}
+
+function computeLogRatioSpread(closesA, closesB) {
+  return closesA.map((a, i) => Math.log(a) - Math.log(closesB[i]))
+}
+
+// Reuses minePricePatterns' exact cluster-evaluation and example-capture
+// logic, just swapping in the spread series for the shape search while
+// keeping NQ's own candles (aligned) for outcome evaluation \u2014 the thing
+// being mined is the relationship, the thing being traded and measured is
+// still NQ, through the same ATR stop/target and friction model as
+// everywhere else in this Lab.
+function mineIntermarketPatterns(nqCandles, esCandles, opts = {}) {
+  const lookback = opts.lookback ?? 24
+  const nPips = opts.nPips ?? 5
+  const minGap = opts.minGap ?? 12
+  const kFixed = opts.kFixed ?? 16
+  const forwardHorizon = opts.forwardHorizon ?? 10
+  const minShapeMembers = opts.minShapeMembers ?? 15
+
+  const { alignedA: nq, alignedB: es } = alignByTimestamp(nqCandles, esCandles)
+  if (nq.length < 500) return { error: 'Too few aligned NQ/ES bars \u2014 check the ticker symbol and month overlap.' }
+
+  const spread = computeLogRatioSpread(nq.map((c) => c.close), es.map((c) => c.close))
+  const patterns = extractPatterns(spread, lookback, nPips, minGap)
+  if (patterns.length < kFixed * 10) return { error: 'Too few spread patterns extracted \u2014 need more months of data or a shorter lookback.' }
+
+  const vectors = patterns.map((p) => p.pattern)
+  const { assignments, centroids } = kmeansCluster(vectors, kFixed)
+
+  const clusters = []
+  for (let c = 0; c < kFixed; c++) {
+    const memberIdx = []
+    for (let i = 0; i < assignments.length; i++) if (assignments[i] === c) memberIdx.push(i)
+    if (memberIdx.length < minShapeMembers) continue
+
+    const cohesionVal = memberIdx.reduce((sum, i) => sum + euclideanDist(vectors[i], centroids[c]), 0) / memberIdx.length
+
+    let direction = null, evalResult = null
+    const fwdReturns = []
+    for (const i of memberIdx) {
+      const endIdx = patterns[i].endIdx
+      if (endIdx + forwardHorizon >= nq.length) continue
+      fwdReturns.push(nq[endIdx + forwardHorizon].close - nq[endIdx].close)
+    }
+    if (fwdReturns.length >= 10) {
+      const avgFwd = fwdReturns.reduce((a, b) => a + b, 0) / fwdReturns.length
+      direction = avgFwd >= 0 ? 'bullish' : 'bearish'
+      const outcomes = []
+      for (const i of memberIdx) {
+        const outcome = simulateEventOutcome(nq, patterns[i].endIdx, direction)
+        if (outcome) outcomes.push(outcome)
+      }
+      evalResult = evaluateCluster(outcomes)
+    }
+
+    const exampleCount = Math.min(4, memberIdx.length)
+    const step = Math.max(1, Math.floor(memberIdx.length / exampleCount))
+    const examples = []
+    for (let e = 0; e < exampleCount; e++) {
+      const i = memberIdx[Math.min(e * step, memberIdx.length - 1)]
+      const endIdx = patterns[i].endIdx
+      examples.push({ endIdx, rawWindow: spread.slice(Math.max(0, endIdx - lookback), endIdx + 1) })
+    }
+
+    clusters.push({
+      clusterId: c, patternCount: memberIdx.length, cohesion: +cohesionVal.toFixed(3),
+      centroidPattern: centroids[c], examples, direction, ...(evalResult || {}),
+    })
+  }
+
+  clusters.sort((a, b) => a.cohesion - b.cohesion)
+  return { totalPatterns: patterns.length, alignedBars: nq.length, k: kFixed, clusters }
+}
+
+// ── SMC Liquidity Sweep + FVG Continuation (Dynamic Profit Hold) ────
+// Ported faithfully from a strategy built in a separate tool, using
+// primitives built from scratch here \u2014 the original app's indicator
+// source code isn't available, so these are independent implementations,
+// each individually tested against known cases (delayed-confirmation
+// swings, look-ahead-safe FVG/CISD/rejection-block) before assembly.
+//
+// Structurally different from every other hypothesis in this Lab: state
+// (adaptive stop-loss level, win/loss streaks, sweep-entry deferral)
+// persists ACROSS trades, and stops are percentage-based, not ATR-based.
+// This needs its own dedicated simulation \u2014 the shared runEngine was
+// never built for this trade structure.
+//
+// Worth flagging honestly: this strategy's rules were shaped through
+// several rounds of watching backtest results and patching specific
+// observed problems (visible in its own iteration notes) \u2014 a real
+// overfitting risk baked into the rule set itself, independent of
+// whether these specific indicator implementations are correct. Testing
+// it properly here, especially on data from after the rules were last
+// changed, is how that concern actually gets resolved rather than
+// assumed either way.
+
+const SMC_ACCOUNT_SIZE = 25000, SMC_RISK_PCT = 1, SMC_POINT_VALUE = 5 // MES
+
+function smcDetectSwingLows(candles, lookback = 5) {
+  const out = new Array(candles.length).fill(false)
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    let ok = true
+    for (let k = 1; k <= lookback; k++) { if (candles[i-k].low <= candles[i].low || candles[i+k].low <= candles[i].low) { ok = false; break } }
+    if (ok) out[i] = true
+  }
+  return out
+}
+function smcDetectSwingHighs(candles, lookback = 5) {
+  const out = new Array(candles.length).fill(false)
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    let ok = true
+    for (let k = 1; k <= lookback; k++) { if (candles[i-k].high >= candles[i].high || candles[i+k].high >= candles[i].high) { ok = false; break } }
+    if (ok) out[i] = true
+  }
+  return out
+}
+function smcDetectBullishBOS(candles, lookback = 5) {
+  const sh = smcDetectSwingHighs(candles, lookback)
+  const out = new Array(candles.length).fill(false)
+  let last = null
+  for (let i = 0; i < candles.length; i++) {
+    const k = i - lookback
+    if (k >= 0 && sh[k]) last = candles[k].high
+    if (last != null && candles[i].close > last) out[i] = true
+  }
+  return out
+}
+function smcDetectBearishBOS(candles, lookback = 5) {
+  const sl = smcDetectSwingLows(candles, lookback)
+  const out = new Array(candles.length).fill(false)
+  let last = null
+  for (let i = 0; i < candles.length; i++) {
+    const k = i - lookback
+    if (k >= 0 && sl[k]) last = candles[k].low
+    if (last != null && candles[i].close < last) out[i] = true
+  }
+  return out
+}
+function smcDetectSweepOfSwingLow(candles, lookback = 5) {
+  const sl = smcDetectSwingLows(candles, lookback)
+  const out = new Array(candles.length).fill(false)
+  let last = null
+  for (let i = 0; i < candles.length; i++) {
+    const k = i - lookback
+    if (k >= 0 && sl[k]) last = candles[k].low
+    if (last != null && candles[i].low < last && candles[i].close > last) out[i] = true
+  }
+  return out
+}
+function smcDetectBullishFVG(candles) {
+  const zones = []
+  const touched = new Array(candles.length).fill(false)
+  for (let i = 2; i < candles.length; i++) {
+    const a = candles[i-2], c = candles[i]
+    if (a.high < c.low) zones.push({ createdAt: i, zoneLow: a.high, zoneHigh: c.low, filled: false })
+  }
+  for (let i = 0; i < candles.length; i++) {
+    for (const z of zones) {
+      if (z.createdAt >= i || z.filled) continue
+      if (candles[i].low <= z.zoneHigh && candles[i].low >= z.zoneLow) { touched[i] = true; z.filled = true }
+    }
+  }
+  return touched
+}
+function smcDetectBullishCISD(candles) {
+  const out = new Array(candles.length).fill(false)
+  for (let i = 1; i < candles.length; i++) {
+    const bullNow = candles[i].close > candles[i].open
+    const bearPrev = candles[i-1].close < candles[i-1].open
+    if (bullNow && bearPrev && candles[i].close > candles[i-1].high) out[i] = true
+  }
+  return out
+}
+function smcDetectBearishCISD(candles) {
+  const out = new Array(candles.length).fill(false)
+  for (let i = 1; i < candles.length; i++) {
+    const bearNow = candles[i].close < candles[i].open
+    const bullPrev = candles[i-1].close > candles[i-1].open
+    if (bearNow && bullPrev && candles[i].close < candles[i-1].low) out[i] = true
+  }
+  return out
+}
+function smcDetectBullishRejectionBlock(candles, thresh = 0.5) {
+  const out = new Array(candles.length).fill(false)
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i], range = c.high - c.low
+    if (range <= 0) continue
+    const lowerWick = Math.min(c.open, c.close) - c.low
+    if (lowerWick / range >= thresh) out[i] = true
+  }
+  return out
+}
+
+function smcSizeAndCostTrade(entryPrice, exitPrice, stopPctUsed) {
+  const riskDollars = SMC_ACCOUNT_SIZE * (SMC_RISK_PCT / 100)
+  const stopDistPoints = entryPrice * (stopPctUsed / 100)
+  const contracts = Math.max(1, Math.floor(riskDollars / (stopDistPoints * SMC_POINT_VALUE)))
+  const slippedEntry = entryPrice + TICK_SIZE * 1
+  const slippedExit  = exitPrice - TICK_SIZE * 1
+  const grossPnl = (slippedExit - slippedEntry) * SMC_POINT_VALUE * contracts
+  const commission = COMMISSION_PER_SIDE * 2 * contracts
+  return { contracts, dollarPnl: grossPnl - commission, riskDollars }
+}
+
+function simulateSMCStrategy(candles) {
+  const ind = {
+    liquiditySweepLow: smcDetectSweepOfSwingLow(candles),
+    bullishFVG: smcDetectBullishFVG(candles),
+    bosBullish: smcDetectBullishBOS(candles),
+    bosBearish: smcDetectBearishBOS(candles),
+    cisdBullish: smcDetectBullishCISD(candles),
+    cisdBearish: smcDetectBearishCISD(candles),
+    rejectionBlockBullish: smcDetectBullishRejectionBlock(candles),
+    swingHigh: smcDetectSwingHighs(candles),
+  }
+  let state = { _sl: 1.8, _consLoss: 0, _consWin: 0, _sweepEntry: false, _deferred: false }
+  let pos = null
+  const trades = []
+
+  for (let i = 20; i < candles.length; i++) {
+    const sweep = ind.liquiditySweepLow[i] || ind.liquiditySweepLow[i-1] || ind.liquiditySweepLow[i-2]
+    const fvg = ind.bullishFVG[i] || ind.bullishFVG[i-1] || ind.bullishFVG[i-2]
+    const bos = ind.bosBullish[i] || ind.bosBullish[i-1] || ind.bosBullish[i-2]
+    const cisd = ind.cisdBullish[i] || ind.cisdBullish[i-1]
+    const rejBlock = ind.rejectionBlockBullish[i] || ind.rejectionBlockBullish[i-1]
+    const bearBos = ind.bosBearish[i] || ind.bosBearish[i-1]
+    const bearCisd = ind.cisdBearish[i] || ind.cisdBearish[i-1]
+    const recentBearBos = ind.bosBearish[i] || ind.bosBearish[i-1] || ind.bosBearish[i-2]
+
+    const ep = pos?.entryPrice || 0
+    const cc = candles[i]?.close || 0
+    const gainPct = ep > 0 ? ((cc - ep) / ep) * 100 : 0
+    const intradayHigh = Math.max(...candles.slice(Math.max(0, i - 26), i + 1).map((c) => c.high))
+    const breakHigh = cc >= intradayHigh
+    const contPat = bos && ind.swingHigh[i]
+    const holdOverride = breakHigh || contPat
+    const hardCap = state._sweepEntry ? 5.0 : 3.0
+    const inSweepDip = state._sweepEntry && sweep
+    const stopHitAdaptive = gainPct <= -state._sl
+    const stopHitHard = gainPct <= -hardCap
+    const inZone = gainPct >= 1.0 && gainPct <= 2.0
+    const lookbackHigh = Math.max(...candles.slice(Math.max(0, i - 10), i + 1).map((c) => c.high))
+    const sharpDrop = cc > 0 && lookbackHigh > 0 && ((lookbackHigh - cc) / lookbackHigh) * 100 >= 1.5
+
+    if (!pos && !recentBearBos && !bearCisd) {
+      const primaryBase = sweep && fvg && bos
+      const primaryScore = (sweep?1:0)+(fvg?1:0)+(bos?1:0)+(cisd?1:0)+(rejBlock?1:0)
+      const dipScore = (fvg?1:0)+(cisd?1:0)+(rejBlock?1:0)+(bos?1:0)+(sweep?1:0)
+      if (primaryBase && primaryScore >= 3) {
+        pos = { entryPrice: cc, entryIdx: i, entryType: 'primary', stopPctAtEntry: state._sl }
+        state._sweepEntry = true; state._deferred = false
+        continue
+      }
+      if (!primaryBase && sharpDrop && fvg && dipScore >= 4) {
+        pos = { entryPrice: cc, entryIdx: i, entryType: 'dip', stopPctAtEntry: state._sl }
+        state._sweepEntry = false; state._deferred = false
+        continue
+      }
+    }
+
+    if (pos) {
+      if (stopHitAdaptive && state._sweepEntry && inSweepDip && !stopHitHard) { state._deferred = true; continue }
+      if (state._deferred && state._sweepEntry && gainPct >= -1.0 && !stopHitHard) continue
+
+      let exitReason = null
+      if (stopHitHard || (stopHitAdaptive && !state._deferred)) {
+        exitReason = stopHitHard ? 'hardCap' : 'adaptiveSL'
+        const newLoss = state._consLoss + 1
+        state._sl = newLoss >= 3 ? Math.max(0.8, +(state._sl - 0.1).toFixed(1)) : state._sl
+        state._consLoss = newLoss >= 3 ? 0 : newLoss
+        state._consWin = 0
+      } else if (inZone && !holdOverride) {
+        exitReason = 'profitZone'
+        const newWin = state._consWin + 1
+        state._sl = newWin >= 3 ? Math.min(1.8, +(state._sl + 0.1).toFixed(1)) : state._sl
+        state._consWin = newWin >= 3 ? 0 : newWin
+        state._consLoss = 0
+      } else if (gainPct > 2.0 && !holdOverride && bearBos) {
+        exitReason = 'extendedExit'
+      } else if (bearBos && !holdOverride) {
+        exitReason = 'biasInvalidation'
+      }
+
+      if (exitReason) {
+        const { contracts, dollarPnl } = smcSizeAndCostTrade(pos.entryPrice, cc, pos.stopPctAtEntry)
+        trades.push({ ...pos, exitIdx: i, exitPrice: cc, gainPct, reason: exitReason, contracts, dollarPnl })
+        pos = null; state._sweepEntry = false; state._deferred = false
+      }
+    }
+  }
+  return trades
+}
+
 // ── H9 Neighborhood Grid ──────────────────────────────────────────
 // A small, fixed, pre-declared grid anchored specifically around H9's own
 // structure (ATR threshold, session scope, entry direction) \u2014 not a
@@ -1889,6 +2207,18 @@ export default function HypothesisLab() {
   const [h9Error, setH9Error]       = useState('')
   const [h9Results, setH9Results]   = useState(null)
 
+  const [imMonths, setImMonths]     = useState([])
+  const [imRunning, setImRunning]   = useState(false)
+  const [imLoadMsg, setImLoadMsg]   = useState('')
+  const [imError, setImError]       = useState('')
+  const [imResults, setImResults]   = useState(null)
+
+  const [smcMonths, setSmcMonths]     = useState([])
+  const [smcRunning, setSmcRunning]   = useState(false)
+  const [smcLoadMsg, setSmcLoadMsg]   = useState('')
+  const [smcError, setSmcError]       = useState('')
+  const [smcResults, setSmcResults]   = useState(null)
+
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
   function toggle(setBucket) {
@@ -1907,6 +2237,11 @@ export default function HypothesisLab() {
     try {
       setLoadMsg('Fetching Train candles\u2026')
       const trainCandles = await fetchSelectedMonths(SYMBOL, '5min', [...trainMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      // TEMPORARY DIAGNOSTIC \u2014 checking whether candles include a volume field.
+      // Safe to remove once confirmed; open the browser console (F12) before clicking Run.
+      console.log('[VOLUME CHECK] Sample candle object:', trainCandles[0])
+      console.log('[VOLUME CHECK] Keys present on this candle:', trainCandles[0] ? Object.keys(trainCandles[0]) : 'no candles returned')
+      console.log('[TICKER CHECK] Available futures symbols from massiveFinance:', FUTURES_SYMBOLS)
       let validateCandles = []
       let testCandles = []
       if (validateMonths.length) {
@@ -2074,6 +2409,60 @@ export default function HypothesisLab() {
     } finally {
       setPtRunning(false)
       setPtLoadMsg('')
+    }
+  }
+
+  async function runSmcStrategyUI() {
+    if (!smcMonths.length) { setSmcError('Select at least one month.'); return }
+    setSmcError('')
+    setSmcRunning(true)
+    setSmcResults(null)
+    try {
+      setSmcLoadMsg(`Fetching ${INTERMARKET_SYMBOL} candles\u2026`)
+      const candles = await fetchSelectedMonths(INTERMARKET_SYMBOL, '15min', [...smcMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      setSmcLoadMsg('Running SMC strategy simulation\u2026')
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      const trades = simulateSMCStrategy(candles)
+      const wins = trades.filter((t) => t.dollarPnl > 0)
+      const totalDollar = trades.reduce((s, t) => s + t.dollarPnl, 0)
+      const byEntryType = {}
+      const byExitReason = {}
+      for (const t of trades) {
+        byEntryType[t.entryType] = (byEntryType[t.entryType] || 0) + 1
+        byExitReason[t.reason] = (byExitReason[t.reason] || 0) + 1
+      }
+      setSmcResults({
+        trades, totalDollar,
+        winRate: trades.length ? +((wins.length / trades.length) * 100).toFixed(1) : 0,
+        byEntryType, byExitReason,
+      })
+    } catch (e) {
+      setSmcError(e.message)
+    } finally {
+      setSmcRunning(false)
+      setSmcLoadMsg('')
+    }
+  }
+
+  async function runIntermarketMinerUI() {
+    if (!imMonths.length) { setImError('Select at least one month.'); return }
+    setImError('')
+    setImRunning(true)
+    setImResults(null)
+    try {
+      setImLoadMsg('Fetching NQ candles\u2026')
+      const nqCandles = await fetchSelectedMonths(SYMBOL, '5min', [...imMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      setImLoadMsg(`Fetching ${INTERMARKET_SYMBOL} candles\u2026`)
+      const esCandles = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', [...imMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      setImLoadMsg('Aligning, computing spread, mining shapes\u2026')
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      const result = mineIntermarketPatterns(nqCandles, esCandles)
+      setImResults(result)
+    } catch (e) {
+      setImError(e.message)
+    } finally {
+      setImRunning(false)
+      setImLoadMsg('')
     }
   }
 
@@ -2871,6 +3260,142 @@ export default function HypothesisLab() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">9. Intermarket Pattern Miner (NQ vs. {INTERMARKET_SYMBOL})</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          The exact same mining engine as Section 6, pointed at a genuinely different series: the log-ratio
+          spread between NQ and {INTERMARKET_SYMBOL} (is NQ outperforming or underperforming) rather
+          than NQ\u2019s own price shape. This is a relationship between two instruments \u2014 something the
+          two prior NQ-only mining runs could not have found no matter how thoroughly they searched.
+          Shapes are found in the spread; outcomes are still measured on NQ itself, same ATR stop/target and
+          friction model as everywhere else. Uses the placeholder ticker {INTERMARKET_SYMBOL} \u2014
+          check the [TICKER CHECK] console log from Section 1\u2019s Train run against your real Massive
+          symbol list if this fails to fetch.
+        </p>
+      </div>
+
+      <MonthPicker label="Intermarket miner months" selected={imMonths} onToggle={toggle(setImMonths)} />
+
+      {imError && <div className="error-box">{imError}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runIntermarketMinerUI} disabled={imRunning} style={{ flex: 1, padding: '11px' }}>
+          {imRunning ? `\u23f3 ${imLoadMsg}` : '\u25b6 Run intermarket miner'}
+        </button>
+      </div>
+
+      {imResults && imResults.error && (
+        <div className="error-box">{imResults.error}</div>
+      )}
+
+      {imResults && !imResults.error && (
+        <div className="card">
+          <div className="card-title">Discovered Spread Shapes ({imResults.alignedBars} aligned bars \u2192 {imResults.totalPatterns} patterns \u2192 {imResults.clusters.length} shapes)</div>
+
+          {imResults.clusters.map((c) => (
+            <div key={c.clusterId} style={{ marginBottom: 18, paddingBottom: 14, borderBottom: '1px solid var(--border)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>
+                  Spread Shape #{c.clusterId}{' '}
+                  <span style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 400 }}>
+                    ({c.patternCount} occurrences, cohesion {c.cohesion})
+                  </span>
+                </div>
+                {c.expectancyR != null ? (
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+                    NQ {c.direction} \u00b7 {c.winRate}% win [{c.winRateLower}\u2013{c.winRateUpper}] \u00b7{' '}
+                    <span style={{ color: c.expectancyR >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                      {c.expectancyR >= 0 ? '+' : ''}{c.expectancyR}R
+                    </span>
+                    {' '}[{c.lower}, {c.upper}]
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>too few forward-return bars to trading-test yet</div>
+                )}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-dim)', marginBottom: 3 }}>Canonical spread shape:</div>
+              <Sparkline values={c.centroidPattern} color="var(--blue)" />
+              <div style={{ fontSize: 10, color: 'var(--text-dim)', margin: '8px 0 3px' }}>Real occurrences, spread across the dataset:</div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                {c.examples.map((ex, i) => (
+                  <Sparkline key={i} values={ex.rawWindow} color="var(--text-muted)" />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">10. SMC Liquidity Sweep + FVG (Dynamic Profit Hold)</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          Ported faithfully from an outside strategy, including its adaptive stop-loss, dip-buy path, and
+          sweep-deferral exit logic \u2014 all built from scratch here since the original indicator source
+          wasn\u2019t available, each primitive tested standalone first. Uses its own dedicated simulation,
+          not the shared engine, since its state (stop level, win/loss streaks) persists across trades and
+          its stops are percentage-based. Sizing matches the original\u2019s stated 1% risk on a $25,000
+          account, MES contracts \u2014 worth knowing that at typical S&amp;P levels this floors to
+          1 contract minimum, which realizes closer to 2% risk per trade than the intended 1%.
+          Its own iteration history shows several rounds of patching in direct response to observed
+          backtest results \u2014 worth testing especially on months after that history ends, not just
+          trusting a good number on the same window it was shaped against. Runs on {INTERMARKET_SYMBOL},
+          15-minute bars, matching how it was originally built.
+        </p>
+      </div>
+
+      <MonthPicker label="SMC strategy months" selected={smcMonths} onToggle={toggle(setSmcMonths)} />
+
+      {smcError && <div className="error-box">{smcError}</div>}
+
+      <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+        <button className="btn-green" onClick={runSmcStrategyUI} disabled={smcRunning} style={{ flex: 1, padding: '11px' }}>
+          {smcRunning ? `\u23f3 ${smcLoadMsg}` : '\u25b6 Run SMC strategy'}
+        </button>
+      </div>
+
+      {smcResults && (
+        <div className="card">
+          <div className="card-title">Results</div>
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            {smcResults.trades.length} trades, {smcResults.winRate}% win rate,{' '}
+            <span style={{ color: smcResults.totalDollar >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
+              {smcResults.totalDollar >= 0 ? '+' : ''}${smcResults.totalDollar.toFixed(0)}
+            </span>
+          </p>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 4 }}>
+            Entries by type: {Object.entries(smcResults.byEntryType).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none'}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 12 }}>
+            Exits by reason: {Object.entries(smcResults.byExitReason).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none'}
+          </div>
+          <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                <th style={{ textAlign: 'left', padding: '3px 6px' }}>Entry type</th>
+                <th style={{ padding: '3px 6px' }}>Gain%</th>
+                <th style={{ padding: '3px 6px' }}>Exit reason</th>
+                <th style={{ padding: '3px 6px' }}>Contracts</th>
+                <th style={{ padding: '3px 6px' }}>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {smcResults.trades.slice(0, 50).map((t, i) => (
+                <tr key={i}>
+                  <td style={{ padding: '3px 6px' }}>{t.entryType}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{t.gainPct >= 0 ? '+' : ''}{t.gainPct.toFixed(2)}%</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{t.reason}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right' }}>{t.contracts}</td>
+                  <td style={{ padding: '3px 6px', textAlign: 'right', color: t.dollarPnl > 0 ? 'var(--green)' : 'var(--red)' }}>{t.dollarPnl >= 0 ? '+' : ''}${t.dollarPnl.toFixed(0)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {smcResults.trades.length > 50 && (
+            <p style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 6 }}>Showing first 50 of {smcResults.trades.length} trades.</p>
+          )}
         </div>
       )}
     </div>
