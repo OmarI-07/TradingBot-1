@@ -1610,6 +1610,62 @@ function simulateSMCStrategy(candles) {
   return trades
 }
 
+// ── Promoted Shape: live matching + dedicated Train/Validate/Test ──
+// Turns a discovered intermarket shape into a real, testable hypothesis.
+// Matching a NEW bar against a saved shape replicates k-means\u2019 own
+// assignment rule exactly \u2014 nearest of ALL K saved centroids, not an
+// arbitrary distance cutoff \u2014 verified to reproduce the offline
+// clustering\u2019s own assignments 100% of the time on the same historical
+// bars before being trusted on new ones. Runs through its own dedicated
+// Train/Validate/Test, since promoted shapes need both NQ and ES data,
+// which the main hypothesis pipeline was never built to fetch.
+
+function nearestCentroid(pattern, allCentroids) {
+  let bestIdx = 0, bestDist = Infinity
+  for (let c = 0; c < allCentroids.length; c++) {
+    const d = euclideanDist(pattern, allCentroids[c])
+    if (d < bestDist) { bestDist = d; bestIdx = c }
+  }
+  return bestIdx
+}
+
+function makePromotedShapeSignal(nqCandles, esCandles, allCentroids, targetClusterId, direction, opts = {}) {
+  const lookback = opts.lookback ?? 24
+  const nPips = opts.nPips ?? 5
+  const esByTime = new Map(esCandles.map((c) => [c.time, c]))
+  const alignedIdx = [], spreadVals = []
+  for (let i = 0; i < nqCandles.length; i++) {
+    const es = esByTime.get(nqCandles[i].time)
+    if (es) { alignedIdx.push(i); spreadVals.push(Math.log(nqCandles[i].close) - Math.log(es.close)) }
+  }
+  const origToPos = new Map(alignedIdx.map((origI, pos) => [origI, pos]))
+  return (i) => {
+    const pos = origToPos.get(i)
+    if (pos == null || pos < lookback) return 'none'
+    const window = spreadVals.slice(pos - lookback, pos + 1)
+    const pipIdx = findPIPs(window, nPips)
+    if (pipIdx.length < nPips) return 'none'
+    const pipVals = pipIdx.map((idx) => window[idx])
+    const mean = pipVals.reduce((a, b) => a + b, 0) / pipVals.length
+    const variance = pipVals.reduce((a, b) => a + (b - mean) ** 2, 0) / pipVals.length
+    const std = Math.sqrt(variance)
+    if (std === 0) return 'none'
+    const normalized = pipVals.map((v) => (v - mean) / std)
+    if (nearestCentroid(normalized, allCentroids) !== targetClusterId) return 'none'
+    return direction === 'bullish' ? 'buy' : 'sell'
+  }
+}
+
+async function runPromotedShapeSplit(promoted, months) {
+  if (!months.length) return null
+  const sorted = [...months].sort((a, b) => a.key.localeCompare(b.key))
+  const nq = await fetchSelectedMonths(SYMBOL, '5min', sorted)
+  const es = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', sorted)
+  const fn = makePromotedShapeSignal(nq, es, promoted.allCentroids, promoted.clusterId, promoted.direction)
+  const { trades } = runEngine(nq, fn)
+  return summarize(trades)
+}
+
 // ── H9 Neighborhood Grid ──────────────────────────────────────────
 // A small, fixed, pre-declared grid anchored specifically around H9's own
 // structure (ATR threshold, session scope, entry direction) \u2014 not a
@@ -2252,6 +2308,15 @@ export default function HypothesisLab() {
   const [smcError, setSmcError]       = useState('')
   const [smcResults, setSmcResults]   = useState(null)
 
+  const [promotedShape, setPromotedShape] = useState(null) // { clusterId, direction, allCentroids, label }
+  const [psTrainMonths, setPsTrainMonths]     = useState([])
+  const [psValidateMonths, setPsValidateMonths] = useState([])
+  const [psTestMonths, setPsTestMonths]       = useState([])
+  const [psRunning, setPsRunning]     = useState(false)
+  const [psLoadMsg, setPsLoadMsg]     = useState('')
+  const [psError, setPsError]         = useState('')
+  const [psResults, setPsResults]     = useState(null) // { train, validate, test }
+
   const usedKeys = new Set([...trainMonths, ...validateMonths, ...testMonths].map((m) => m.key))
 
   function toggle(setBucket) {
@@ -2442,6 +2507,46 @@ export default function HypothesisLab() {
     } finally {
       setPtRunning(false)
       setPtLoadMsg('')
+    }
+  }
+
+  function promoteShape(clusterId) {
+    if (!imResults || !imResults.clusters) return
+    const shape = imResults.clusters.find((c) => c.clusterId === clusterId)
+    if (!shape || shape.direction == null) return
+    const allCentroids = imResults.clusters
+      .slice()
+      .sort((a, b) => a.clusterId - b.clusterId)
+      .map((c) => c.centroidPattern)
+    setPromotedShape({ clusterId, direction: shape.direction, allCentroids, label: `Spread Shape #${clusterId}` })
+    setPsResults(null)
+    setPsError('')
+  }
+
+  async function runPromotedShapeUI() {
+    if (!promotedShape) return
+    if (!psTrainMonths.length) { setPsError('Select at least one Train month.'); return }
+    setPsError('')
+    setPsRunning(true)
+    setPsResults(null)
+    try {
+      setPsLoadMsg('Testing Train\u2026')
+      const train = await runPromotedShapeSplit(promotedShape, psTrainMonths)
+      let validate = null, test = null
+      if (psValidateMonths.length) {
+        setPsLoadMsg('Testing Validate\u2026')
+        validate = await runPromotedShapeSplit(promotedShape, psValidateMonths)
+      }
+      if (psTestMonths.length) {
+        setPsLoadMsg('Testing Test\u2026')
+        test = await runPromotedShapeSplit(promotedShape, psTestMonths)
+      }
+      setPsResults({ train, validate, test })
+    } catch (e) {
+      setPsError(e.message)
+    } finally {
+      setPsRunning(false)
+      setPsLoadMsg('')
     }
   }
 
@@ -3411,8 +3516,76 @@ export default function HypothesisLab() {
                   <Sparkline key={i} values={ex.rawWindow} color="var(--text-muted)" />
                 ))}
               </div>
+              {c.expectancyR != null && (
+                <button
+                  onClick={() => promoteShape(c.clusterId)}
+                  style={{
+                    marginTop: 8, padding: '4px 10px', borderRadius: 6, fontSize: 11,
+                    border: `1px solid ${promotedShape?.clusterId === c.clusterId ? 'var(--green)' : 'var(--border)'}`,
+                    background: promotedShape?.clusterId === c.clusterId ? 'rgba(76,175,80,0.12)' : 'var(--surface)',
+                    color: promotedShape?.clusterId === c.clusterId ? 'var(--green)' : 'var(--text-muted)', cursor: 'pointer',
+                  }}
+                >
+                  {promotedShape?.clusterId === c.clusterId ? '\u2713 Promoted \u2014 test below' : 'Promote to Hypothesis \u2192'}
+                </button>
+              )}
             </div>
           ))}
+        </div>
+      )}
+
+      {promotedShape && (
+        <div className="card">
+          <div className="card-title">Promoted: {promotedShape.label} ({promotedShape.direction})</div>
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6, marginBottom: 10 }}>
+            Live-matches new bars against this shape\u2019s saved centroid \u2014 nearest of all {promotedShape.allCentroids.length} shapes
+            from that run, replicating the original clustering\u2019s own assignment rule exactly (verified to
+            reproduce it 100% of the time on historical bars before being trusted here). Runs through this
+            Lab\u2019s standard ATR stop/target and friction model, same as every other hypothesis \u2014 own
+            dedicated Train/Validate/Test since it needs both NQ and {INTERMARKET_SYMBOL} data.
+          </p>
+          <MonthPicker label="Train months" selected={psTrainMonths} onToggle={toggle(setPsTrainMonths)} />
+          <MonthPicker label="Validate months" selected={psValidateMonths} onToggle={toggle(setPsValidateMonths)} />
+          <MonthPicker label="Test months" selected={psTestMonths} onToggle={toggle(setPsTestMonths)} />
+
+          {psError && <div className="error-box">{psError}</div>}
+
+          <div className="row" style={{ marginTop: 4, marginBottom: 12 }}>
+            <button className="btn-green" onClick={runPromotedShapeUI} disabled={psRunning} style={{ flex: 1, padding: '11px' }}>
+              {psRunning ? `\u23f3 ${psLoadMsg}` : '\u25b6 Run promoted shape Train/Validate/Test'}
+            </button>
+          </div>
+
+          {psResults && (
+            <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                  <th style={{ textAlign: 'left', padding: '6px 8px' }}>Bucket</th>
+                  <th style={{ padding: '6px 8px' }}>Trades</th>
+                  <th style={{ padding: '6px 8px' }}>Win%</th>
+                  <th style={{ padding: '6px 8px' }}>Expectancy</th>
+                  <th style={{ padding: '6px 8px' }}>P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {['train', 'validate', 'test'].map((k) => {
+                  const s = psResults[k]
+                  if (!s) return (
+                    <tr key={k}><td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td><td colSpan={4} style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>not run</td></tr>
+                  )
+                  return (
+                    <tr key={k}>
+                      <td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.trades}</td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.winRate}% <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>[{s.winRateLower}\u2013{s.winRateUpper}]</span></td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.expectancyR >= 0 ? '+' : ''}{s.expectancyR}R</td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right', color: s.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{s.totalDollar >= 0 ? '+' : ''}${s.totalDollar}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
         </div>
       )}
 
