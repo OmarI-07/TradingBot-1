@@ -1786,6 +1786,29 @@ const STRATEGY_INDICATOR_LIBRARY = {
   bollingerUpper: (candles) => calcBollingerBands(candles).upper,
   bollingerMiddle: (candles) => calcBollingerBands(candles).middle,
   bollingerLower: (candles) => calcBollingerBands(candles).lower,
+  bearishIFVG: (candles) => detectBearishIFVG(candles),
+}
+
+// Bearish IFVG: a bullish FVG (untraded gap up) that later gets
+// invalidated -- price closes back below the gap's floor, flipping what
+// was a bullish signal to bearish. Fires exactly once per zone, at the
+// moment of invalidation, not on every subsequent bar below the floor --
+// verified directly, since an earlier version of this lacked that and
+// incorrectly kept re-firing indefinitely.
+function detectBearishIFVG(candles) {
+  const zones = []
+  for (let i = 2; i < candles.length; i++) {
+    const a = candles[i - 2], c = candles[i]
+    if (a.high < c.low) zones.push({ createdAt: i, zoneLow: a.high, triggered: false })
+  }
+  const flipped = new Array(candles.length).fill(false)
+  for (let i = 0; i < candles.length; i++) {
+    for (const z of zones) {
+      if (z.createdAt >= i || z.triggered) continue
+      if (candles[i].close < z.zoneLow) { flipped[i] = true; z.triggered = true }
+    }
+  }
+  return flipped
 }
 
 function calcRSISeries(candles, period = 14) {
@@ -1862,11 +1885,35 @@ function runImportedStrategy(candles, signalBodyCode, sizingOpts = {}) {
       const contracts = Math.max(1, Math.floor(riskDollars / (stopDistPoints * pointValue)))
       const grossPnl = (candles[i].close - pos.entryPrice) * pointValue * contracts
       const commission = COMMISSION_PER_SIDE * 2 * contracts
-      trades.push({ entryIdx: pos.entryIdx, exitIdx: i, gainPct, reason: result.reason, contracts, dollarPnl: grossPnl - commission, rMult: gainPct })
+      trades.push({ entryIdx: pos.entryIdx, exitIdx: i, gainPct, reason: result.reason, contracts, dollarPnl: grossPnl - commission, commission, rMult: gainPct / (entryStopPct || 1.8) })
       pos = null
     }
   }
   return { trades, referenced, missing: [] }
+}
+
+async function runImportedStrategySplit(signalBodyCode, symbol, months) {
+  if (!months.length) return null
+  const sorted = [...months].sort((a, b) => a.key.localeCompare(b.key))
+  const candles = await fetchSelectedMonths(symbol, '15min', sorted)
+  const result = runImportedStrategy(candles, signalBodyCode)
+  if (result.error) return { error: result.error }
+  return summarize(result.trades)
+}
+
+async function runImportedStrategyWalkForward(signalBodyCode, symbol, months) {
+  const perMonth = []
+  const allTrades = []
+  for (const month of months) {
+    const candles = await fetchSelectedMonths(symbol, '15min', [month])
+    const result = runImportedStrategy(candles, signalBodyCode)
+    if (result.error) return { error: result.error }
+    const monthDollar = result.trades.reduce((s, t) => s + t.dollarPnl, 0)
+    perMonth.push({ month: month.key, trades: result.trades.length, dollarPnl: +monthDollar.toFixed(0), profitable: monthDollar > 0 })
+    allTrades.push(...result.trades)
+  }
+  const profitableMonths = perMonth.filter((m) => m.profitable).length
+  return { perMonth, totalMonths: perMonth.length, profitableMonths, stitched: summarize(allTrades) }
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -2887,6 +2934,24 @@ export default function HypothesisLab() {
   const siDetected = siCode ? detectReferencedIndicators(siCode) : []
   const siMissing = siDetected.filter((n) => !STRATEGY_INDICATOR_LIBRARY[n])
 
+  const [siTrainMonths, setSiTrainMonths]     = useState([])
+  const [siValidateMonths, setSiValidateMonths] = useState([])
+  const [siTestMonths, setSiTestMonths]       = useState([])
+  const [siTvtRunning, setSiTvtRunning]       = useState(false)
+  const [siTvtError, setSiTvtError]           = useState('')
+  const [siTvtResults, setSiTvtResults]       = useState(null)
+
+  const [siWfMonths, setSiWfMonths]           = useState([])
+  const [siWfRunning, setSiWfRunning]         = useState(false)
+  const [siWfError, setSiWfError]             = useState('')
+  const [siWfResults, setSiWfResults]         = useState(null)
+
+  const [siPtMonths, setSiPtMonths]           = useState([])
+  const [siPtRunning, setSiPtRunning]         = useState(false)
+  const [siPtLoadMsg, setSiPtLoadMsg]         = useState('')
+  const [siPtError, setSiPtError]             = useState('')
+  const [siPtResults, setSiPtResults]         = useState(null)
+
   const [ddNPips, setDdNPips]       = useState(8)
   const [ddSubK, setDdSubK]         = useState(4)
   const [ddRunning, setDdRunning]   = useState(false)
@@ -3506,6 +3571,81 @@ export default function HypothesisLab() {
       setSiError(e.message)
     } finally {
       setSiRunning(false)
+    }
+  }
+
+  async function runImportedTvtUI() {
+    if (!siCode.trim()) { setSiTvtError('Paste the signalBody code first.'); return }
+    if (!siTrainMonths.length) { setSiTvtError('Select at least one Train month.'); return }
+    setSiTvtError('')
+    setSiTvtRunning(true)
+    setSiTvtResults(null)
+    try {
+      const train = await runImportedStrategySplit(siCode, siSymbol, siTrainMonths)
+      let validate = null, test = null
+      if (siValidateMonths.length) validate = await runImportedStrategySplit(siCode, siSymbol, siValidateMonths)
+      if (siTestMonths.length) test = await runImportedStrategySplit(siCode, siSymbol, siTestMonths)
+      setSiTvtResults({ train, validate, test })
+    } catch (e) {
+      setSiTvtError(e.message)
+    } finally {
+      setSiTvtRunning(false)
+    }
+  }
+
+  async function runImportedWfUI() {
+    if (!siCode.trim()) { setSiWfError('Paste the signalBody code first.'); return }
+    if (!siWfMonths.length) { setSiWfError('Select at least one month.'); return }
+    setSiWfError('')
+    setSiWfRunning(true)
+    setSiWfResults(null)
+    try {
+      const sorted = [...siWfMonths].sort((a, b) => a.key.localeCompare(b.key))
+      const result = await runImportedStrategyWalkForward(siCode, siSymbol, sorted)
+      setSiWfResults(result)
+    } catch (e) {
+      setSiWfError(e.message)
+    } finally {
+      setSiWfRunning(false)
+    }
+  }
+
+  async function runImportedPermutationUI() {
+    if (!siCode.trim()) { setSiPtError('Paste the signalBody code first.'); return }
+    if (!siPtMonths.length) { setSiPtError('Select at least one month.'); return }
+    setSiPtError('')
+    setSiPtRunning(true)
+    setSiPtResults(null)
+    try {
+      const sorted = [...siPtMonths].sort((a, b) => a.key.localeCompare(b.key))
+      setSiPtLoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(siSymbol, '15min', sorted)
+      const realResult = runImportedStrategy(candles, siCode)
+      if (realResult.error) { setSiPtResults({ error: realResult.error }); return }
+      const realStats = summarize(realResult.trades)
+
+      const numPermutations = 20
+      let asGoodOrBetter = 0
+      const permExpectancies = []
+      for (let p = 0; p < numPermutations; p++) {
+        setSiPtLoadMsg(`Running permutation ${p + 1} of ${numPermutations}\u2026`)
+        await new Promise((r) => setTimeout(r, 0))
+        const permuted = permuteBars(candles, 0)
+        const permResult = runImportedStrategy(permuted, siCode)
+        const permExpectancy = permResult.trades && permResult.trades.length ? summarize(permResult.trades).expectancyR : -Infinity
+        permExpectancies.push(permExpectancy)
+        if (permExpectancy >= realStats.expectancyR) asGoodOrBetter++
+      }
+      permExpectancies.sort((a, b) => a - b)
+      setSiPtResults({
+        realStats, pValue: asGoodOrBetter / numPermutations, numPermutations,
+        permMin: permExpectancies[0], permMedian: permExpectancies[Math.floor(permExpectancies.length / 2)], permMax: permExpectancies[permExpectancies.length - 1],
+      })
+    } catch (e) {
+      setSiPtError(e.message)
+    } finally {
+      setSiPtRunning(false)
+      setSiPtLoadMsg('')
     }
   }
 
@@ -5194,6 +5334,136 @@ export default function HypothesisLab() {
               </table>
             </div>
           )}
+
+          <div className="card" style={{ marginTop: 20 }}>
+            <div className="card-title">Train / Validate / Test</div>
+            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              Same discipline every other hypothesis in this Lab gets. Uses the pasted code above and the
+              symbol selected in the single-run section.
+            </p>
+            <MonthPicker label="Train" selected={siTrainMonths} onToggle={toggle(setSiTrainMonths)} />
+            <MonthPicker label="Validate" selected={siValidateMonths} onToggle={toggle(setSiValidateMonths)} />
+            <MonthPicker label="Test" selected={siTestMonths} onToggle={toggle(setSiTestMonths)} />
+            {siTvtError && <div className="error-box">{siTvtError}</div>}
+            <div className="row" style={{ marginBottom: 12 }}>
+              <button className="btn-green" onClick={runImportedTvtUI} disabled={siTvtRunning || siMissing.length > 0} style={{ flex: 1, padding: '11px' }}>
+                {siTvtRunning ? '\u23f3 Running\u2026' : '\u25b6 Run Train / Validate / Test'}
+              </button>
+            </div>
+            {siTvtResults && (
+              <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                    <th style={{ textAlign: 'left', padding: '6px 8px' }}>Bucket</th>
+                    <th style={{ padding: '6px 8px' }}>Trades</th>
+                    <th style={{ padding: '6px 8px' }}>Win%</th>
+                    <th style={{ padding: '6px 8px' }}>Expectancy</th>
+                    <th style={{ padding: '6px 8px' }}>P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {['train', 'validate', 'test'].map((k) => {
+                    const s = siTvtResults[k]
+                    if (!s) return (
+                      <tr key={k}><td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td><td colSpan={4} style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>not run</td></tr>
+                    )
+                    if (s.error) return (
+                      <tr key={k}><td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td><td colSpan={4} style={{ padding: '6px 8px', color: 'var(--red)' }}>{s.error}</td></tr>
+                    )
+                    return (
+                      <tr key={k}>
+                        <td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.trades}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.winRate}%</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.expectancyR >= 0 ? '+' : ''}{s.expectancyR}R</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: s.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{s.totalDollar >= 0 ? '+' : ''}${s.totalDollar}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="card-title">Walk-Forward</div>
+            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              Each month tested individually, then stitched together \u2014 the test that has caught nearly
+              every false lead in this Lab.
+            </p>
+            <MonthPicker label="" selected={siWfMonths} onToggle={toggle(setSiWfMonths)} />
+            {siWfError && <div className="error-box">{siWfError}</div>}
+            <div className="row" style={{ marginBottom: 12 }}>
+              <button className="btn-green" onClick={runImportedWfUI} disabled={siWfRunning || siMissing.length > 0} style={{ flex: 1, padding: '11px' }}>
+                {siWfRunning ? '\u23f3 Running\u2026' : '\u25b6 Run Walk-Forward'}
+              </button>
+            </div>
+            {siWfResults && siWfResults.error && <div className="error-box">{siWfResults.error}</div>}
+            {siWfResults && !siWfResults.error && (
+              <>
+                <p style={{ fontSize: 13, marginBottom: 10 }}>
+                  Profitable in {siWfResults.profitableMonths} of {siWfResults.totalMonths} months. Stitched:{' '}
+                  {siWfResults.stitched.trades} trades, {siWfResults.stitched.winRate}% win,{' '}
+                  expectancy {siWfResults.stitched.expectancyR >= 0 ? '+' : ''}{siWfResults.stitched.expectancyR}R,{' '}
+                  <span style={{ color: siWfResults.stitched.totalDollar >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                    {siWfResults.stitched.totalDollar >= 0 ? '+' : ''}${siWfResults.stitched.totalDollar}
+                  </span>
+                </p>
+                <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                      <th style={{ textAlign: 'left', padding: '4px 8px' }}>Month</th>
+                      <th style={{ padding: '4px 8px' }}>Trades</th>
+                      <th style={{ padding: '4px 8px' }}>P&amp;L</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {siWfResults.perMonth.map((m, i) => (
+                      <tr key={i}>
+                        <td style={{ padding: '4px 8px' }}>{m.month}</td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right' }}>{m.trades}</td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right', color: m.profitable ? 'var(--green)' : 'var(--red)' }}>{m.dollarPnl >= 0 ? '+' : ''}${m.dollarPnl}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="card-title">Monte Carlo Permutation Test</div>
+            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              Is this result distinguishable from what the same rule produces on scrambled data? 20
+              permutations, same standard as every other permutation test in this Lab.
+            </p>
+            <MonthPicker label="" selected={siPtMonths} onToggle={toggle(setSiPtMonths)} />
+            {siPtError && <div className="error-box">{siPtError}</div>}
+            <div className="row" style={{ marginBottom: 12 }}>
+              <button className="btn-green" onClick={runImportedPermutationUI} disabled={siPtRunning || siMissing.length > 0} style={{ flex: 1, padding: '11px' }}>
+                {siPtRunning ? `\u23f3 ${siPtLoadMsg}` : '\u25b6 Run Permutation Test'}
+              </button>
+            </div>
+            {siPtResults && siPtResults.error && <div className="error-box">{siPtResults.error}</div>}
+            {siPtResults && !siPtResults.error && (
+              <>
+                <p style={{ fontSize: 13, marginBottom: 6 }}>
+                  Real: {siPtResults.realStats.trades} trades, expectancy{' '}
+                  <strong>{siPtResults.realStats.expectancyR >= 0 ? '+' : ''}{siPtResults.realStats.expectancyR}R</strong>
+                </p>
+                <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                  color: siPtResults.pValue <= 0.01 ? 'var(--green)' : siPtResults.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                  p = {(siPtResults.pValue * 100).toFixed(1)}%
+                </p>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>
+                  {(siPtResults.pValue * 100).toFixed(1)}% of {siPtResults.numPermutations} permutations matched or beat this real result.
+                </p>
+                <p style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+                  Permutation distribution: min {siPtResults.permMin.toFixed(3)}R, median {siPtResults.permMedian.toFixed(3)}R, max {siPtResults.permMax.toFixed(3)}R
+                </p>
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>
