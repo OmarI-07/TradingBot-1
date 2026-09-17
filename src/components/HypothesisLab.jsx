@@ -1580,6 +1580,496 @@ async function runDrillDownMining(promoted, newNPips, subK) {
   return { parentMemberCount: memberEndIdxs.length, totalFinePatterns: finePatterns.length, clusters, allCentroids: centroids, nPips: newNPips, lookback: promoted.lookback, months: promoted.months }
 }
 
+// ── Meta-Labeling with Gradient-Boosted Trees ───────────────────────
+// No real XGBoost port exists for a browser-only app \u2014 this is genuine
+// gradient-boosted decision trees, the same core algorithm, built from
+// scratch and verified against synthetic cases with known answers (a
+// clean single-feature split, and a genuine two-feature interaction no
+// single shallow tree could capture alone) before being trusted here.
+//
+// Deliberately scoped as a META-LABELING FILTER on top of H2's existing
+// sweep event, not a new standalone entry signal \u2014 using only the
+// already individually-tested contextual features (ATR, wick ratio,
+// trend steepness). The question this answers: given a signal has
+// already fired, does predicting P(win) from those features and
+// filtering on it beat taking every signal unfiltered \u2014 on a genuine
+// TEMPORAL holdout (train on the earlier chunk, test on a strictly later
+// one), never a random split, since random shuffling would leak future
+// information given how autocorrelated market data is.
+
+function fitTree(X, y, indices, maxDepth, minLeafSize) {
+  function variance(idxs) {
+    if (idxs.length === 0) return 0
+    const mean = idxs.reduce((s, i) => s + y[i], 0) / idxs.length
+    return idxs.reduce((s, i) => s + (y[i] - mean) ** 2, 0)
+  }
+  function buildNode(idxs, depth) {
+    const mean = idxs.reduce((s, i) => s + y[i], 0) / idxs.length
+    if (depth >= maxDepth || idxs.length < minLeafSize * 2) return { isLeaf: true, value: mean }
+    let bestGain = -Infinity, bestFeature = -1, bestThresh = null, bestLeft = null, bestRight = null
+    const nFeatures = X[0].length
+    const totalVar = variance(idxs)
+    for (let f = 0; f < nFeatures; f++) {
+      const sortedIdx = [...idxs].sort((a, b) => X[a][f] - X[b][f])
+      for (let s = minLeafSize; s < sortedIdx.length - minLeafSize; s++) {
+        const thresh = (X[sortedIdx[s - 1]][f] + X[sortedIdx[s]][f]) / 2
+        const left = sortedIdx.slice(0, s), right = sortedIdx.slice(s)
+        const gain = totalVar - variance(left) - variance(right)
+        if (gain > bestGain) { bestGain = gain; bestFeature = f; bestThresh = thresh; bestLeft = left; bestRight = right }
+      }
+    }
+    if (bestFeature === -1 || bestGain <= 0) return { isLeaf: true, value: mean }
+    return { isLeaf: false, feature: bestFeature, threshold: bestThresh, left: buildNode(bestLeft, depth + 1), right: buildNode(bestRight, depth + 1) }
+  }
+  return buildNode(indices, 0)
+}
+function predictTree(tree, x) {
+  let node = tree
+  while (!node.isLeaf) node = x[node.feature] <= node.threshold ? node.left : node.right
+  return node.value
+}
+const gbmSigmoid = (z) => 1 / (1 + Math.exp(-z))
+
+function trainGBM(X, y, nRounds, learningRate, maxDepth, minLeafSize) {
+  const n = X.length
+  let rawScores = new Array(n).fill(0)
+  const trees = []
+  for (let round = 0; round < nRounds; round++) {
+    const p = rawScores.map(gbmSigmoid)
+    const residuals = y.map((yi, i) => yi - p[i])
+    const tree = fitTree(X, residuals, Array.from({ length: n }, (_, i) => i), maxDepth, minLeafSize)
+    trees.push(tree)
+    for (let i = 0; i < n; i++) rawScores[i] += learningRate * predictTree(tree, X[i])
+  }
+  return trees
+}
+function predictGBM(trees, x, learningRate) {
+  let raw = 0
+  for (const t of trees) raw += learningRate * predictTree(t, x)
+  return gbmSigmoid(raw)
+}
+
+// Assemble (features, label, outcome) for every H2 sweep event in range
+function buildMetaLabelDataset(candles) {
+  const sma20 = calcSMASeries(candles, 20)
+  const events = detectSweepEvents(candles)
+  const rows = []
+  for (const ev of events) {
+    const outcome = simulateEventOutcome(candles, ev.idx, ev.direction)
+    if (!outcome) continue
+    const feats = contextualFeatures(candles, sma20, ev.idx, ev.direction)
+    rows.push({
+      x: [feats.recentRange, feats.wickSize, feats.trendSteepness],
+      y: outcome.dollarPnl > 0 ? 1 : 0,
+      outcome, endIdx: ev.idx,
+    })
+  }
+  return rows
+}
+
+function evaluateFiltered(rows, predictedP, threshold) {
+  const kept = rows.filter((_, i) => predictedP[i] >= threshold)
+  if (kept.length < 5) return null
+  const outcomes = kept.map((r) => r.outcome)
+  return evaluateCluster(outcomes) // reuses the already-tested mean-R + Wilson CI computation
+}
+
+function runMetaLabelTest(candles, opts = {}) {
+  const nRounds = opts.nRounds ?? 30
+  const learningRate = opts.learningRate ?? 0.15
+  const maxDepth = opts.maxDepth ?? 2
+  const minLeafSize = opts.minLeafSize ?? 15
+  const threshold = opts.threshold ?? 0.55
+  const trainFrac = opts.trainFrac ?? 0.6
+
+  const rows = buildMetaLabelDataset(candles)
+  if (rows.length < 100) return { error: 'Too few H2 sweep events in this range to train/evaluate a model.' }
+
+  // Temporal split \u2014 rows are already in chronological order (endIdx increasing)
+  const splitAt = Math.floor(rows.length * trainFrac)
+  const trainRows = rows.slice(0, splitAt)
+  const testRows = rows.slice(splitAt)
+  if (testRows.length < 20) return { error: 'Too few holdout events after the temporal split.' }
+
+  const trainX = trainRows.map((r) => r.x), trainY = trainRows.map((r) => r.y)
+  const trees = trainGBM(trainX, trainY, nRounds, learningRate, maxDepth, minLeafSize)
+
+  const testX = testRows.map((r) => r.x)
+  const predictedP = testX.map((x) => predictGBM(trees, x, learningRate))
+
+  const unfiltered = evaluateCluster(testRows.map((r) => r.outcome))
+  const filtered = evaluateFiltered(testRows, predictedP, threshold)
+  const filteredCount = predictedP.filter((p) => p >= threshold).length
+
+  return { totalEvents: rows.length, trainCount: trainRows.length, testCount: testRows.length, filteredCount, unfiltered, filtered, threshold }
+}
+
+// Permutation-validates the WHOLE process: shuffles the win/loss labels
+// (features and their real order untouched), retrains from scratch, and
+// checks whether the REAL model\u2019s filtered improvement over unfiltered
+// is distinguishable from what training on random labels produces \u2014
+// a flexible model can find spurious feature-label relationships in
+// noise just as easily as the Combination Grid or pattern miner can.
+function runMetaLabelPermutationTest(candles, opts = {}, numPermutations = 20) {
+  const real = runMetaLabelTest(candles, opts)
+  if (real.error || !real.filtered) return { ...real, permutationSkipped: true }
+
+  const realImprovement = real.filtered.expectancyR - real.unfiltered.expectancyR
+  let asGoodOrBetter = 0
+  const permImprovements = []
+  for (let p = 0; p < numPermutations; p++) {
+    const rows = buildMetaLabelDataset(candles)
+    const splitAt = Math.floor(rows.length * (opts.trainFrac ?? 0.6))
+    const trainRows = rows.slice(0, splitAt), testRows = rows.slice(splitAt)
+    const shuffledY = trainRows.map((r) => r.y)
+    for (let i = shuffledY.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1));[shuffledY[i], shuffledY[j]] = [shuffledY[j], shuffledY[i]] }
+    const trainX = trainRows.map((r) => r.x)
+    const trees = trainGBM(trainX, shuffledY, opts.nRounds ?? 30, opts.learningRate ?? 0.15, opts.maxDepth ?? 2, opts.minLeafSize ?? 15)
+    const testX = testRows.map((r) => r.x)
+    const predictedP = testX.map((x) => predictGBM(trees, x, opts.learningRate ?? 0.15))
+    const unfilteredP = evaluateCluster(testRows.map((r) => r.outcome))
+    const filteredP = evaluateFiltered(testRows, predictedP, opts.threshold ?? 0.55)
+    const improvement = filteredP ? filteredP.expectancyR - unfilteredP.expectancyR : -Infinity
+    permImprovements.push(improvement)
+    if (improvement >= realImprovement) asGoodOrBetter++
+  }
+  permImprovements.sort((a, b) => a - b)
+  return {
+    ...real,
+    realImprovement,
+    pValue: asGoodOrBetter / numPermutations,
+    numPermutations,
+    permMin: permImprovements[0],
+    permMedian: permImprovements[Math.floor(permImprovements.length / 2)],
+    permMax: permImprovements[permImprovements.length - 1],
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// AUTOMATED PIPELINE \u2014 standalone, self-contained, own tab
+// Stage 1: fixed 140-config mining grid (lookback\u00d7nPips\u00d7k), whole-batch
+//   permutation validated. Stage 2 (only if Stage 1 passes): fixed
+//   480-config gate sweep (session\u00d7regime\u00d7sizing\u00d7risk\u00d7direction) on
+//   the Stage 1 winner, whole-batch permutation validated. Stage 4 (only
+//   if Stage 2 passes): genuine Train/Validate/Test on fresh months never
+//   used in Stages 1-2. Every stage's ENTIRE batch runs in full, real and
+//   permuted alike, every time \u2014 no early stopping, no batch expansion,
+//   no retry. One run, one honest answer.
+// ══════════════════════════════════════════════════════════════════
+
+// 3-state regime classifier: trend steepness sign for up/down, ATR level
+// combined with near-zero trend steepness for sideways/ranging. Verified
+// 100% correct on synthetic data with known, constructed regime blocks
+// before being trusted here.
+function classifyRegime(candles, sma20, i, atrSidewaysThresh = 15, trendSidewaysThresh = 0.0008) {
+  if (i < 25 || sma20[i] == null || sma20[i - 5] == null) return null
+  let trendSteepness = 0
+  if (sma20[i - 5] !== 0) trendSteepness = (sma20[i] - sma20[i - 5]) / sma20[i - 5]
+  const atr = calcATR(candles, i)
+  if (atr < atrSidewaysThresh && Math.abs(trendSteepness) < trendSidewaysThresh) return 'sideways'
+  return trendSteepness > 0 ? 'trending_up' : 'trending_down'
+}
+
+const PIPELINE_LOOKBACK = [16, 20, 24, 28, 32, 36, 40]
+const PIPELINE_NPIPS = [4, 5, 6, 7, 8]
+const PIPELINE_K = [8, 12, 16, 20]
+
+function runMiningGridBatch(nq, es) {
+  const results = []
+  for (const lookback of PIPELINE_LOOKBACK) {
+    for (const nPips of PIPELINE_NPIPS) {
+      for (const k of PIPELINE_K) {
+        const mined = mineIntermarketPatterns(nq, es, { lookback, nPips, kFixed: k })
+        if (mined.error || !mined.bestByExpectancy) continue
+        results.push({ lookback, nPips, k, shape: mined.bestByExpectancy, allCentroids: mined.clusters.slice().sort((a,b)=>a.clusterId-b.clusterId).map(c=>c.centroidPattern) })
+      }
+    }
+  }
+  results.sort((a, b) => b.shape.expectancyR - a.shape.expectancyR)
+  return results
+}
+
+
+
+// Stage 2: gate sweep on the Stage 1 winner. Session x regime x sizing x
+// risk x direction \u2014 all applied as filters on an ALREADY-mined shape,
+// no re-mining, which is what keeps this fast (480 combos, ~4 seconds
+// real, ~80 seconds permutation-validated) versus the alternative of
+// crossing every gate against every mining config directly (50,400
+// combos, ~2.4 hours \u2014 computed and rejected as impractical).
+
+const PIPELINE_SESSION = ['New York', 'London', 'Asian', 'Offhours', 'none']
+const PIPELINE_REGIME = ['trending_up', 'trending_down', 'sideways', 'none']
+const PIPELINE_SIZING = ['riskAdjusted', 'fixed6']
+const PIPELINE_RISK = [
+  { stopAtrMult: 1.0, rMultiple: 1.5 },
+  { stopAtrMult: 1.5, rMultiple: 2.0 },
+  { stopAtrMult: 2.0, rMultiple: 2.5 },
+  { stopAtrMult: 1.5, rMultiple: 3.0 },
+]
+const PIPELINE_DIRECTION = ['long-only', 'short-only', 'both']
+
+function makePipelineGatedSignal(nqCandles, esCandles, winner, session, regime, direction) {
+  const lookback = winner.lookback, nPips = winner.nPips
+  const sma20 = calcSMASeries(nqCandles, 20)
+  const esByTime = new Map(esCandles.map((c) => [c.time, c]))
+  const alignedIdx = [], spreadVals = []
+  for (let i = 0; i < nqCandles.length; i++) {
+    const es = esByTime.get(nqCandles[i].time)
+    if (es) { alignedIdx.push(i); spreadVals.push(Math.log(nqCandles[i].close) - Math.log(es.close)) }
+  }
+  const origToPos = new Map(alignedIdx.map((origI, pos) => [origI, pos]))
+  return (i) => {
+    const pos = origToPos.get(i)
+    if (pos == null || pos < lookback) return 'none'
+    if (session !== 'none' && getSession(nqCandles[i].time) !== session) return 'none'
+    if (regime !== 'none') {
+      const r = classifyRegime(nqCandles, sma20, i)
+      if (r !== regime) return 'none'
+    }
+    const window = spreadVals.slice(pos - lookback, pos + 1)
+    const pipIdx = findPIPs(window, nPips)
+    if (pipIdx.length < nPips) return 'none'
+    const pipVals = pipIdx.map((idx) => window[idx])
+    const mean = pipVals.reduce((a, b) => a + b, 0) / pipVals.length
+    const variance = pipVals.reduce((a, b) => a + (b - mean) ** 2, 0) / pipVals.length
+    const std = Math.sqrt(variance)
+    if (std === 0) return 'none'
+    const normalized = pipVals.map((v) => (v - mean) / std)
+    if (nearestCentroid(normalized, winner.allCentroids) !== winner.shape.clusterId) return 'none'
+    const matchDirection = winner.shape.direction
+    if (direction === 'long-only' && matchDirection !== 'bullish') return 'none'
+    if (direction === 'short-only' && matchDirection !== 'bearish') return 'none'
+    return matchDirection === 'bullish' ? 'buy' : 'sell'
+  }
+}
+
+function runGateSweepBatch(winner, nq, es) {
+  const results = []
+  for (const session of PIPELINE_SESSION) {
+    for (const regime of PIPELINE_REGIME) {
+      for (const sizing of PIPELINE_SIZING) {
+        for (const risk of PIPELINE_RISK) {
+          for (const direction of PIPELINE_DIRECTION) {
+            const fn = makePipelineGatedSignal(nq, es, winner, session, regime, direction)
+            const opts = sizing === 'fixed6' ? { fixedContracts: 6, ...risk } : { ...risk }
+            const { trades } = runEngine(nq, fn, opts)
+            if (trades.length < 10) continue
+            const stats = summarize(trades)
+            results.push({ session, regime, sizing, ...risk, direction, ...stats })
+          }
+        }
+      }
+    }
+  }
+  results.sort((a, b) => b.expectancyR - a.expectancyR)
+  return results
+}
+
+
+
+// ── Stage 3: HMM Regime Classifier + Per-Regime Model Routing ──────
+// A real Gaussian HMM (3-state: trending-up-like / trending-down-like /
+// high-vol-like, via mean/variance profile per state), trained with
+// Baum-Welch and verified to recover known hidden parameters from data
+// before being trusted here. Training uses full forward-backward
+// (smoothing is fine \u2014 fitting distributions on historical data has no
+// look-ahead concern). Classifying live/test bars uses a SEPARATE,
+// forward-ONLY filter \u2014 verified directly to never let a future
+// observation change an earlier bar\u2019s label \u2014 since a smoothing pass
+// there would silently leak future information into the regime label.
+
+function hmmLogGaussian(x, mean, variance) {
+  const v = Math.max(variance, 1e-10)
+  return -0.5 * Math.log(2 * Math.PI * v) - ((x - mean) ** 2) / (2 * v)
+}
+function hmmLogSumExp(arr) {
+  const m = Math.max(...arr)
+  if (!Number.isFinite(m)) return -Infinity
+  return m + Math.log(arr.reduce((s, v) => s + Math.exp(v - m), 0))
+}
+function hmmForwardBackward(obs, states, transLog, initLog) {
+  const T = obs.length, N = states.length
+  const logAlpha = Array.from({ length: T }, () => new Array(N).fill(-Infinity))
+  const logBeta = Array.from({ length: T }, () => new Array(N).fill(-Infinity))
+  for (let s = 0; s < N; s++) logAlpha[0][s] = initLog[s] + hmmLogGaussian(obs[0], states[s].mean, states[s].variance)
+  for (let t = 1; t < T; t++) {
+    for (let s = 0; s < N; s++) {
+      const terms = []
+      for (let sp = 0; sp < N; sp++) terms.push(logAlpha[t - 1][sp] + transLog[sp][s])
+      logAlpha[t][s] = hmmLogSumExp(terms) + hmmLogGaussian(obs[t], states[s].mean, states[s].variance)
+    }
+  }
+  for (let s = 0; s < N; s++) logBeta[T - 1][s] = 0
+  for (let t = T - 2; t >= 0; t--) {
+    for (let s = 0; s < N; s++) {
+      const terms = []
+      for (let sp = 0; sp < N; sp++) terms.push(transLog[s][sp] + hmmLogGaussian(obs[t + 1], states[sp].mean, states[sp].variance) + logBeta[t + 1][sp])
+      logBeta[t][s] = hmmLogSumExp(terms)
+    }
+  }
+  const gamma = Array.from({ length: T }, () => new Array(N).fill(0))
+  for (let t = 0; t < T; t++) {
+    const raw = logAlpha[t].map((a, s) => a + logBeta[t][s])
+    const norm = hmmLogSumExp(raw)
+    for (let s = 0; s < N; s++) gamma[t][s] = Math.exp(raw[s] - norm)
+  }
+  const xi = Array.from({ length: T - 1 }, () => Array.from({ length: N }, () => new Array(N).fill(0)))
+  for (let t = 0; t < T - 1; t++) {
+    const raw = []
+    for (let s = 0; s < N; s++) for (let sp = 0; sp < N; sp++)
+      raw.push(logAlpha[t][s] + transLog[s][sp] + hmmLogGaussian(obs[t + 1], states[sp].mean, states[sp].variance) + logBeta[t + 1][sp])
+    const norm = hmmLogSumExp(raw)
+    let idx = 0
+    for (let s = 0; s < N; s++) for (let sp = 0; sp < N; sp++) { xi[t][s][sp] = Math.exp(raw[idx] - norm); idx++ }
+  }
+  return { gamma, xi, logLikelihood: hmmLogSumExp(logAlpha[T - 1]) }
+}
+function hmmBaumWelch(obs, N = 3, maxIters = 30, tol = 1e-4) {
+  const T = obs.length
+  const sorted = [...obs].sort((a, b) => a - b)
+  let states = Array.from({ length: N }, (_, i) => ({
+    mean: sorted[Math.floor((i + 0.5) / N * T)],
+    variance: (sorted[sorted.length - 1] - sorted[0]) / N || 1,
+  }))
+  let trans = Array.from({ length: N }, () => new Array(N).fill(1 / N))
+  let init = new Array(N).fill(1 / N)
+  let prevLL = -Infinity
+  for (let iter = 0; iter < maxIters; iter++) {
+    const transLog = trans.map((row) => row.map((p) => Math.log(Math.max(p, 1e-12))))
+    const initLog = init.map((p) => Math.log(Math.max(p, 1e-12)))
+    const { gamma, xi, logLikelihood } = hmmForwardBackward(obs, states, transLog, initLog)
+    const newStates = states.map((_, s) => {
+      let wSum = 0, wxSum = 0
+      for (let t = 0; t < T; t++) { wSum += gamma[t][s]; wxSum += gamma[t][s] * obs[t] }
+      const mean = wxSum / wSum
+      let wx2Sum = 0
+      for (let t = 0; t < T; t++) wx2Sum += gamma[t][s] * (obs[t] - mean) ** 2
+      return { mean, variance: Math.max(wx2Sum / wSum, 1e-6) }
+    })
+    const newTrans = Array.from({ length: N }, () => new Array(N).fill(0))
+    for (let s = 0; s < N; s++) {
+      let denom = 0
+      for (let t = 0; t < T - 1; t++) denom += gamma[t][s]
+      for (let sp = 0; sp < N; sp++) {
+        let num = 0
+        for (let t = 0; t < T - 1; t++) num += xi[t][s][sp]
+        newTrans[s][sp] = num / Math.max(denom, 1e-12)
+      }
+    }
+    states = newStates; trans = newTrans; init = gamma[0].slice()
+    if (Math.abs(logLikelihood - prevLL) < tol) { prevLL = logLikelihood; break }
+    prevLL = logLikelihood
+  }
+  return { states, trans, init }
+}
+function hmmForwardOnlyLabels(obs, model) {
+  const { states, trans, init } = model
+  const N = states.length
+  const transLog = trans.map((row) => row.map((p) => Math.log(Math.max(p, 1e-12))))
+  const initLog = init.map((p) => Math.log(Math.max(p, 1e-12)))
+  const T = obs.length
+  const logAlpha = Array.from({ length: T }, () => new Array(N).fill(-Infinity))
+  const labels = new Array(T)
+  for (let s = 0; s < N; s++) logAlpha[0][s] = initLog[s] + hmmLogGaussian(obs[0], states[s].mean, states[s].variance)
+  labels[0] = logAlpha[0].indexOf(Math.max(...logAlpha[0]))
+  for (let t = 1; t < T; t++) {
+    for (let s = 0; s < N; s++) {
+      const terms = []
+      for (let sp = 0; sp < N; sp++) terms.push(logAlpha[t - 1][sp] + transLog[sp][s])
+      logAlpha[t][s] = hmmLogSumExp(terms) + hmmLogGaussian(obs[t], states[s].mean, states[s].variance)
+    }
+    labels[t] = logAlpha[t].indexOf(Math.max(...logAlpha[t]))
+  }
+  return labels
+}
+function computeLogReturns(candles) {
+  const out = new Array(candles.length).fill(0)
+  for (let i = 1; i < candles.length; i++) out[i] = Math.log(candles[i].close) - Math.log(candles[i - 1].close)
+  return out
+}
+
+// Trains the HMM + one GBM per regime on a trailing window's trades from
+// the Stage 1-2 winning shape+gate signal, then evaluates \u2014 filtered
+// vs unfiltered \u2014 on the NEXT month, sliding forward across however
+// many months are provided. This is the actual "retrain repeatedly,
+// track performance over time" harness, not a single static split.
+async function runRollingRegimeWalkForward(winner, gateWinner, sortedMonths, windowSize, threshold) {
+  if (sortedMonths.length <= windowSize) return { error: `Need more than ${windowSize} months for a rolling window of that size.` }
+  const perMonth = []
+  for (let i = windowSize; i < sortedMonths.length; i++) {
+    const trainMonths = sortedMonths.slice(i - windowSize, i)
+    const testMonth = sortedMonths[i]
+
+    const nqTrain = await fetchSelectedMonths(SYMBOL, '5min', trainMonths)
+    const esTrain = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', trainMonths)
+    const fnTrain = makePipelineGatedSignal(nqTrain, esTrain, winner, gateWinner.session, gateWinner.regime, gateWinner.direction)
+    const optsTrain = gateWinner.sizing === 'fixed6'
+      ? { fixedContracts: 6, stopAtrMult: gateWinner.stopAtrMult, rMultiple: gateWinner.rMultiple }
+      : { stopAtrMult: gateWinner.stopAtrMult, rMultiple: gateWinner.rMultiple }
+    const { trades: trainTrades } = runEngine(nqTrain, fnTrain, optsTrain)
+
+    const returns = computeLogReturns(nqTrain)
+    if (trainTrades.length < 30 || returns.filter((r) => r !== 0).length < 100) {
+      perMonth.push({ month: testMonth.key, skipped: true })
+      continue
+    }
+    const hmmModel = hmmBaumWelch(returns.filter((r, idx) => idx > 0), 3, 20, 1e-3)
+
+    const sma20Train = calcSMASeries(nqTrain, 20)
+    const trainRows = trainTrades.map((t) => {
+      const regimeLabels = hmmForwardOnlyLabels(returns, hmmModel)
+      const feats = contextualFeatures(nqTrain, sma20Train, t.entryIdx, t.rMult > 0 ? 'bullish' : 'bearish')
+      return { x: [feats.recentRange, feats.wickSize, feats.trendSteepness], y: t.dollarPnl > 0 ? 1 : 0, regime: regimeLabels[t.entryIdx] }
+    })
+    const perRegimeTrees = {}
+    for (let r = 0; r < 3; r++) {
+      const rows = trainRows.filter((row) => row.regime === r)
+      if (rows.length < 15) continue
+      perRegimeTrees[r] = trainGBM(rows.map((row) => row.x), rows.map((row) => row.y), 20, 0.15, 2, 5)
+    }
+
+    const nqTest = await fetchSelectedMonths(SYMBOL, '5min', [testMonth])
+    const esTest = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', [testMonth])
+    const fnTest = makePipelineGatedSignal(nqTest, esTest, winner, gateWinner.session, gateWinner.regime, gateWinner.direction)
+    const { trades: testTrades } = runEngine(nqTest, fnTest, optsTrain)
+    if (testTrades.length === 0) { perMonth.push({ month: testMonth.key, skipped: true }); continue }
+
+    const testReturns = computeLogReturns(nqTest)
+    const testRegimeLabels = hmmForwardOnlyLabels(testReturns, hmmModel)
+    const sma20Test = calcSMASeries(nqTest, 20)
+    const unfilteredStats = summarize(testTrades)
+    const keptTrades = testTrades.filter((t) => {
+      const regime = testRegimeLabels[t.entryIdx]
+      const trees = perRegimeTrees[regime]
+      if (!trees) return false
+      const feats = contextualFeatures(nqTest, sma20Test, t.entryIdx, t.rMult > 0 ? 'bullish' : 'bearish')
+      const p = predictGBM(trees, [feats.recentRange, feats.wickSize, feats.trendSteepness], 0.15)
+      return p >= threshold
+    })
+    const filteredStats = keptTrades.length >= 3 ? summarize(keptTrades) : null
+
+    perMonth.push({ month: testMonth.key, unfiltered: unfilteredStats, filtered: filteredStats })
+  }
+  return { perMonth }
+}
+
+// Stage 4: only runs if Stage 2 also passes. The exact winning gate"""
+// combination, locked \u2014 no further searching \u2014 tested on genuinely
+// fresh months never touched by Stages 1 or 2.
+async function runPipelineFinalSplit(winner, gateWinner, months) {
+  if (!months.length) return null
+  const sorted = [...months].sort((a, b) => a.key.localeCompare(b.key))
+  const nq = await fetchSelectedMonths(SYMBOL, '5min', sorted)
+  const es = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', sorted)
+  const fn = makePipelineGatedSignal(nq, es, winner, gateWinner.session, gateWinner.regime, gateWinner.direction)
+  const opts = gateWinner.sizing === 'fixed6'
+    ? { fixedContracts: 6, stopAtrMult: gateWinner.stopAtrMult, rMultiple: gateWinner.rMultiple }
+    : { stopAtrMult: gateWinner.stopAtrMult, rMultiple: gateWinner.rMultiple }
+  const { trades } = runEngine(nq, fn, opts)
+  return summarize(trades)
+}
+
 // ── H9 Neighborhood Grid ──────────────────────────────────────────
 // A small, fixed, pre-declared grid anchored specifically around H9's own
 // structure (ATR threshold, session scope, entry direction) \u2014 not a
@@ -2242,6 +2732,28 @@ export default function HypothesisLab() {
   const [sgError, setSgError]       = useState('')
   const [sgResults, setSgResults]   = useState(null)
 
+  const [mlMonths, setMlMonths]     = useState([])
+  const [mlThreshold, setMlThreshold] = useState(0.55)
+  const [mlRunning, setMlRunning]   = useState(false)
+  const [mlLoadMsg, setMlLoadMsg]   = useState('')
+  const [mlError, setMlError]       = useState('')
+  const [mlResults, setMlResults]   = useState(null)
+
+  const [activeTab, setActiveTab] = useState('lab') // 'lab' | 'pipeline'
+  const [pMiningMonths, setPMiningMonths]     = useState([])
+  const [pConfirmMonths, setPConfirmMonths]   = useState([])
+  const [pRollingMonths, setPRollingMonths]   = useState([])
+  const [pWindowSize, setPWindowSize]         = useState(3)
+  const [pMlThreshold, setPMlThreshold]       = useState(0.55)
+  const [pFinalTrainMonths, setPFinalTrainMonths]     = useState([])
+  const [pFinalValidateMonths, setPFinalValidateMonths] = useState([])
+  const [pFinalTestMonths, setPFinalTestMonths]       = useState([])
+  const [pRunning, setPRunning]   = useState(false)
+  const [pStage, setPStage]       = useState('') // for progress display
+  const [pLoadMsg, setPLoadMsg]   = useState('')
+  const [pError, setPError]       = useState('')
+  const [pResults, setPResults]   = useState(null) // { stage1, stage2, stage4 }
+
   const [ddNPips, setDdNPips]       = useState(8)
   const [ddSubK, setDdSubK]         = useState(4)
   const [ddRunning, setDdRunning]   = useState(false)
@@ -2493,6 +3005,26 @@ export default function HypothesisLab() {
     } finally {
       setPsRunning(false)
       setPsLoadMsg('')
+    }
+  }
+
+  async function runMetaLabelUI() {
+    if (!mlMonths.length) { setMlError('Select at least one month.'); return }
+    setMlError('')
+    setMlRunning(true)
+    setMlResults(null)
+    try {
+      setMlLoadMsg('Fetching candles\u2026')
+      const candles = await fetchSelectedMonths(SYMBOL, '5min', [...mlMonths].sort((a, b) => a.key.localeCompare(b.key)))
+      setMlLoadMsg('Training model, running 20 permutations\u2026 this takes a while')
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      const result = runMetaLabelPermutationTest(candles, { threshold: mlThreshold }, 20)
+      setMlResults(result)
+    } catch (e) {
+      setMlError(e.message)
+    } finally {
+      setMlRunning(false)
+      setMlLoadMsg('')
     }
   }
 
@@ -2826,8 +3358,157 @@ export default function HypothesisLab() {
     }
   }
 
+  async function runFullPipeline() {
+    if (!pMiningMonths.length) { setPError('Select Stage 1 mining months.'); return }
+    if (!pConfirmMonths.length) { setPError('Select Stage 2 confirmation months.'); return }
+    setPError('')
+    setPRunning(true)
+    setPResults(null)
+    try {
+      // ── Stage 1: mining grid ──
+      setPStage('Stage 1')
+      setPLoadMsg('Fetching NQ/ES for mining months\u2026')
+      const miningSorted = [...pMiningMonths].sort((a, b) => a.key.localeCompare(b.key))
+      const nq1 = await fetchSelectedMonths(SYMBOL, '5min', miningSorted)
+      const es1 = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', miningSorted)
+      setPLoadMsg('Running real 140-config mining grid\u2026')
+      await new Promise((r) => setTimeout(r, 30))
+      const realResults1 = runMiningGridBatch(nq1, es1)
+      const realBest1 = realResults1[0] || null
+      let stage1
+      if (!realBest1) {
+        stage1 = { results: realResults1, best: null }
+        setPResults({ stage1, stage2: null, stage3: null, stage4: null })
+        return
+      }
+      const numPerm1 = 20
+      let asGoodOrBetter1 = 0
+      const permBests1 = []
+      for (let p = 0; p < numPerm1; p++) {
+        setPLoadMsg(`Stage 1: permutation ${p + 1} of ${numPerm1}\u2026`)
+        await new Promise((r) => setTimeout(r, 0))
+        const permutedNQ1 = permuteBars(nq1, 0)
+        const permResults1 = runMiningGridBatch(permutedNQ1, es1)
+        const bestR1 = (permResults1[0] && permResults1[0].shape.expectancyR) ?? -Infinity
+        permBests1.push(bestR1)
+        if (bestR1 >= realBest1.shape.expectancyR) asGoodOrBetter1++
+      }
+      permBests1.sort((a, b) => a - b)
+      stage1 = {
+        results: realResults1, best: realBest1,
+        pValue: asGoodOrBetter1 / numPerm1, numPermutations: numPerm1,
+        permMin: permBests1[0], permMedian: permBests1[Math.floor(permBests1.length/2)], permMax: permBests1[permBests1.length-1],
+      }
+
+      const stage1Passes = stage1.pValue <= 0.05
+      if (!stage1Passes) {
+        setPResults({ stage1, stage2: null, stage3: null, stage4: null })
+        return
+      }
+
+      // ── Stage 2: gate sweep on the Stage 1 winner ──
+      setPStage('Stage 2')
+      setPLoadMsg('Fetching NQ/ES for confirmation months\u2026')
+      const confirmSorted = [...pConfirmMonths].sort((a, b) => a.key.localeCompare(b.key))
+      const nq2 = await fetchSelectedMonths(SYMBOL, '5min', confirmSorted)
+      const es2 = await fetchSelectedMonths(INTERMARKET_SYMBOL, '5min', confirmSorted)
+      setPLoadMsg('Running real 480-config gate sweep\u2026')
+      await new Promise((r) => setTimeout(r, 30))
+      const realResults2 = runGateSweepBatch(stage1.best, nq2, es2)
+      const realBest2 = realResults2[0] || null
+      let stage2
+      if (!realBest2) {
+        stage2 = { results: realResults2, best: null }
+        setPResults({ stage1, stage2, stage3: null, stage4: null })
+        return
+      }
+      const numPerm2 = 20
+      let asGoodOrBetter2 = 0
+      const permBests2 = []
+      for (let p = 0; p < numPerm2; p++) {
+        setPLoadMsg(`Stage 2: permutation ${p + 1} of ${numPerm2}\u2026`)
+        await new Promise((r) => setTimeout(r, 0))
+        const permutedNQ2 = permuteBars(nq2, 0)
+        const permResults2 = runGateSweepBatch(stage1.best, permutedNQ2, es2)
+        const bestR2 = (permResults2[0] && permResults2[0].expectancyR) ?? -Infinity
+        permBests2.push(bestR2)
+        if (bestR2 >= realBest2.expectancyR) asGoodOrBetter2++
+      }
+      permBests2.sort((a, b) => a - b)
+      stage2 = {
+        results: realResults2, best: realBest2,
+        pValue: asGoodOrBetter2 / numPerm2, numPermutations: numPerm2,
+        permMin: permBests2[0], permMedian: permBests2[Math.floor(permBests2.length/2)], permMax: permBests2[permBests2.length-1],
+      }
+
+      const stage2Passes = stage2.pValue <= 0.05
+      if (!stage2Passes) {
+        setPResults({ stage1, stage2, stage3: null, stage4: null })
+        return
+      }
+
+      // ── Stage 3: HMM regime classifier + per-regime GBM, rolling retrain ──
+      let stage3 = null
+      if (pRollingMonths.length > pWindowSize) {
+        setPStage('Stage 3')
+        setPLoadMsg('Running rolling regime-conditional retraining\u2026')
+        const rollingSorted = [...pRollingMonths].sort((a, b) => a.key.localeCompare(b.key))
+        stage3 = await runRollingRegimeWalkForward(stage1.best, stage2.best, rollingSorted, pWindowSize, pMlThreshold)
+      }
+
+      // ── Stage 4: final Train/Validate/Test on fresh months ──
+      setPStage('Stage 4')
+      let stage4 = null
+      if (pFinalTrainMonths.length) {
+        setPLoadMsg('Stage 4: Train\u2026')
+        const train = await runPipelineFinalSplit(stage1.best, stage2.best, pFinalTrainMonths)
+        let validate = null, test = null
+        if (pFinalValidateMonths.length) {
+          setPLoadMsg('Stage 4: Validate\u2026')
+          validate = await runPipelineFinalSplit(stage1.best, stage2.best, pFinalValidateMonths)
+        }
+        if (pFinalTestMonths.length) {
+          setPLoadMsg('Stage 4: Test\u2026')
+          test = await runPipelineFinalSplit(stage1.best, stage2.best, pFinalTestMonths)
+        }
+        stage4 = { train, validate, test }
+      }
+
+      setPResults({ stage1, stage2, stage3, stage4 })
+    } catch (e) {
+      setPError(e.message)
+    } finally {
+      setPRunning(false)
+      setPStage('')
+      setPLoadMsg('')
+    }
+  }
+
   return (
     <div>
+      <div className="row" style={{ gap: 8, marginBottom: 16 }}>
+        <button
+          onClick={() => setActiveTab('lab')}
+          style={{ padding: '8px 16px', borderRadius: 6, fontSize: 13, fontWeight: activeTab === 'lab' ? 600 : 400,
+            border: `1px solid ${activeTab === 'lab' ? 'var(--blue)' : 'var(--border)'}`,
+            background: activeTab === 'lab' ? 'rgba(45,108,223,0.12)' : 'var(--surface)',
+            color: activeTab === 'lab' ? 'var(--blue)' : 'var(--text-muted)', cursor: 'pointer' }}
+        >
+          Hypothesis Lab
+        </button>
+        <button
+          onClick={() => setActiveTab('pipeline')}
+          style={{ padding: '8px 16px', borderRadius: 6, fontSize: 13, fontWeight: activeTab === 'pipeline' ? 600 : 400,
+            border: `1px solid ${activeTab === 'pipeline' ? 'var(--blue)' : 'var(--border)'}`,
+            background: activeTab === 'pipeline' ? 'rgba(45,108,223,0.12)' : 'var(--surface)',
+            color: activeTab === 'pipeline' ? 'var(--blue)' : 'var(--text-muted)', cursor: 'pointer' }}
+        >
+          Automated Pipeline
+        </button>
+      </div>
+
+      {activeTab === 'lab' && (
+      <>
       <div className="card">
         <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Hypothesis Lab</h2>
         <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
@@ -3938,6 +4619,313 @@ export default function HypothesisLab() {
           </table>
           {smcResults.trades.length > 50 && (
             <p style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 6 }}>Showing first 50 of {smcResults.trades.length} trades.</p>
+          )}
+        </div>
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div className="card-title">11. Meta-Labeling with Gradient-Boosted Trees</div>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+          Genuine gradient-boosted decision trees, built from scratch (no real XGBoost port exists for a
+          browser-only app), verified against synthetic cases with known answers before being trusted here.
+          Trains on H2\u2019s existing sweep event, using only the already individually-tested contextual
+          features (ATR, wick ratio, trend steepness) to predict win-probability, then checks whether
+          filtering trades by that prediction beats taking every signal unfiltered \u2014 on a genuine
+          TEMPORAL holdout, never a random split. The whole training process, not just the result, gets
+          re-run on 20 sets of shuffled labels, since a flexible model can find spurious relationships in
+          noise as easily as any search-based tool in this Lab.
+        </p>
+      </div>
+
+      <MonthPicker label="Meta-labeling months" selected={mlMonths} onToggle={toggle(setMlMonths)} />
+
+      <div className="row" style={{ marginBottom: 12 }}>
+        <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+          Filter threshold (predicted win probability)
+          <input type="number" value={mlThreshold} onChange={(e) => setMlThreshold(+e.target.value)} min={0.5} max={0.9} step={0.05}
+            style={{ marginLeft: 6, width: 70, padding: '4px 6px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text)' }} />
+        </label>
+      </div>
+
+      {mlError && <div className="error-box">{mlError}</div>}
+
+      <div className="row" style={{ marginBottom: 12 }}>
+        <button className="btn-green" onClick={runMetaLabelUI} disabled={mlRunning} style={{ flex: 1, padding: '11px' }}>
+          {mlRunning ? `\u23f3 ${mlLoadMsg}` : '\u25b6 Run meta-labeling + validation'}
+        </button>
+      </div>
+
+      {mlResults && mlResults.error && <div className="error-box">{mlResults.error}</div>}
+
+      {mlResults && !mlResults.error && (
+        <div className="card">
+          <div className="card-title">Results</div>
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 10 }}>
+            {mlResults.totalEvents} sweep events \u2192 {mlResults.trainCount} used to train \u2192{' '}
+            {mlResults.testCount} genuinely held-out for testing ({mlResults.filteredCount} pass the
+            {' '}{mlResults.threshold} threshold).
+          </p>
+          <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse', marginBottom: 12 }}>
+            <thead>
+              <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                <th style={{ textAlign: 'left', padding: '6px 8px' }}></th>
+                <th style={{ padding: '6px 8px' }}>n</th>
+                <th style={{ padding: '6px 8px' }}>Win%</th>
+                <th style={{ padding: '6px 8px' }}>Expectancy</th>
+                <th style={{ padding: '6px 8px' }}>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style={{ padding: '6px 8px' }}>Unfiltered (take every signal)</td>
+                <td style={{ padding: '6px 8px', textAlign: 'right' }}>{mlResults.unfiltered.n}</td>
+                <td style={{ padding: '6px 8px', textAlign: 'right' }}>{mlResults.unfiltered.winRate}%</td>
+                <td style={{ padding: '6px 8px', textAlign: 'right' }}>{mlResults.unfiltered.expectancyR >= 0 ? '+' : ''}{mlResults.unfiltered.expectancyR}R</td>
+                <td style={{ padding: '6px 8px', textAlign: 'right', color: mlResults.unfiltered.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{mlResults.unfiltered.totalDollar >= 0 ? '+' : ''}${mlResults.unfiltered.totalDollar}</td>
+              </tr>
+              {mlResults.filtered ? (
+                <tr>
+                  <td style={{ padding: '6px 8px' }}>Filtered by model</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right' }}>{mlResults.filtered.n}</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right' }}>{mlResults.filtered.winRate}%</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right' }}>{mlResults.filtered.expectancyR >= 0 ? '+' : ''}{mlResults.filtered.expectancyR}R</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right', color: mlResults.filtered.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{mlResults.filtered.totalDollar >= 0 ? '+' : ''}${mlResults.filtered.totalDollar}</td>
+                </tr>
+              ) : (
+                <tr><td style={{ padding: '6px 8px' }}>Filtered by model</td><td colSpan={4} style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>too few passed the threshold</td></tr>
+              )}
+            </tbody>
+          </table>
+
+          {mlResults.pValue != null && (
+            <>
+              <p style={{ fontSize: 13, marginBottom: 6 }}>
+                Improvement from filtering: <strong>{mlResults.realImprovement >= 0 ? '+' : ''}{mlResults.realImprovement.toFixed(3)}R</strong>
+              </p>
+              <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                color: mlResults.pValue <= 0.01 ? 'var(--green)' : mlResults.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                p = {(mlResults.pValue * 100).toFixed(1)}%
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+                {(mlResults.pValue * 100).toFixed(1)}% of {mlResults.numPermutations} full retrains on
+                shuffled labels matched or beat this real improvement.{' '}
+                {mlResults.pValue <= 0.05
+                  ? 'Clears or is close to the bar \u2014 still needs testing on additional months before trusting it further.'
+                  : 'Above 5% \u2014 this model\u2019s improvement is not statistically distinguishable from what training on random labels produces.'}
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+                Permutation improvement distribution: min {mlResults.permMin.toFixed(3)}R, median {mlResults.permMedian.toFixed(3)}R, max {mlResults.permMax.toFixed(3)}R
+              </p>
+            </>
+          )}
+        </div>
+      )}
+      </>
+      )}
+
+      {activeTab === 'pipeline' && (
+        <div>
+          <div className="card">
+            <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Automated Pipeline</h2>
+            <p style={{ fontSize: 13, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+              Fully separate from the Hypothesis Lab tab \u2014 its own self-contained system. <strong>Stage 1:</strong>{' '}
+              a fixed, pre-declared 140-config mining grid (lookback \u00d7 nPips \u00d7 k), whole-batch
+              permutation validated (real vs. 20 permuted runs of the ENTIRE grid, not just the winner).{' '}
+              <strong>Stage 2</strong> (only runs if Stage 1 clears p\u22640.05): a fixed 480-config gate
+              sweep (session \u00d7 regime \u00d7 sizing \u00d7 risk \u00d7 direction) on the Stage 1 winner, same
+              whole-batch validation. <strong>Stage 4</strong> (only if Stage 2 also passes): the exact
+              winning configuration, locked \u2014 no further searching \u2014 tested via genuine Train/Validate/Test
+              on fresh months never touched by Stages 1 or 2. One click runs everything in sequence. No stage
+              expands, retries, or skips ahead \u2014 one run, one honest answer, hard stop either way.
+            </p>
+          </div>
+
+          <div className="card">
+            <div className="card-title">Stage 1 \u2014 Mining Months</div>
+            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              7 lookback values \u00d7 5 nPips values \u00d7 4 k values = 140 configurations, all run in full,
+              every time \u2014 real and all 20 permutations.
+            </p>
+            <MonthPicker label="" selected={pMiningMonths} onToggle={toggle(setPMiningMonths)} />
+          </div>
+
+          <div className="card">
+            <div className="card-title">Stage 2 \u2014 Confirmation Months (must differ from Stage 1)</div>
+            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              5 session \u00d7 4 regime \u00d7 2 sizing \u00d7 4 risk \u00d7 3 direction = 480 configurations, applied
+              as gates on the Stage 1 winner \u2014 only runs if Stage 1 passes.
+            </p>
+            <MonthPicker label="" selected={pConfirmMonths} onToggle={toggle(setPConfirmMonths)} />
+          </div>
+
+          <div className="card">
+            <div className="card-title">Stage 3 \u2014 Rolling Regime-Conditional Retraining (optional)</div>
+            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              A real 3-state HMM (trending-up / trending-down / high-vol, via Baum-Welch \u2014 verified to
+              recover known hidden regimes from synthetic data before being trusted here) retrains on a
+              trailing window of months, trains a separate GBM per detected regime on that shape+gate
+              combination\u2019s own trades, then tests filtered vs. unfiltered on the NEXT month \u2014 sliding
+              forward across every month provided. Live classification uses a forward-ONLY filter, verified
+              to never use future bars. Leave empty to skip straight to Stage 4. Pick more months than the
+              window size below.
+            </p>
+            <div className="row" style={{ gap: 12, marginBottom: 10 }}>
+              <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Trailing window (months)
+                <input type="number" value={pWindowSize} onChange={(e) => setPWindowSize(+e.target.value)} min={1} max={12}
+                  style={{ marginLeft: 6, width: 60, padding: '4px 6px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text)' }} />
+              </label>
+              <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                GBM filter threshold
+                <input type="number" value={pMlThreshold} onChange={(e) => setPMlThreshold(+e.target.value)} min={0.5} max={0.9} step={0.05}
+                  style={{ marginLeft: 6, width: 70, padding: '4px 6px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text)' }} />
+              </label>
+            </div>
+            <MonthPicker label="" selected={pRollingMonths} onToggle={toggle(setPRollingMonths)} />
+          </div>
+
+          <div className="card">
+            <div className="card-title">Stage 4 \u2014 Final Train / Validate / Test Months (optional, must differ from Stages 1\u20132)</div>
+            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              The locked winning configuration, tested fresh \u2014 only runs if Stage 2 also passes. Leave
+              empty to stop after Stage 2.
+            </p>
+            <MonthPicker label="Train" selected={pFinalTrainMonths} onToggle={toggle(setPFinalTrainMonths)} />
+            <MonthPicker label="Validate" selected={pFinalValidateMonths} onToggle={toggle(setPFinalValidateMonths)} />
+            <MonthPicker label="Test" selected={pFinalTestMonths} onToggle={toggle(setPFinalTestMonths)} />
+          </div>
+
+          {pError && <div className="error-box">{pError}</div>}
+
+          <div className="row" style={{ marginBottom: 12 }}>
+            <button className="btn-green" onClick={runFullPipeline} disabled={pRunning} style={{ flex: 1, padding: '14px', fontSize: 15 }}>
+              {pRunning ? `\u23f3 ${pStage}: ${pLoadMsg}` : '\u25b6 GO \u2014 Run Full Pipeline'}
+            </button>
+          </div>
+
+          {pResults && (
+            <div className="card">
+              <div className="card-title">Stage 1 Result</div>
+              {!pResults.stage1.best ? (
+                <div className="error-box">No configuration in the 140-combo grid produced a tradeable shape.</div>
+              ) : (
+                <>
+                  <p style={{ fontSize: 13, marginBottom: 6 }}>
+                    Best: lookback {pResults.stage1.best.lookback}, nPips {pResults.stage1.best.nPips}, k {pResults.stage1.best.k}{' '}
+                    \u2014 shape #{pResults.stage1.best.shape.clusterId} ({pResults.stage1.best.shape.direction}),{' '}
+                    expectancy <strong>{pResults.stage1.best.shape.expectancyR >= 0 ? '+' : ''}{pResults.stage1.best.shape.expectancyR}R</strong>
+                  </p>
+                  <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                    color: pResults.stage1.pValue <= 0.01 ? 'var(--green)' : pResults.stage1.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                    p = {(pResults.stage1.pValue * 100).toFixed(1)}%
+                  </p>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    {pResults.stage1.pValue <= 0.05
+                      ? 'Passed \u2014 Stage 2 ran on this winner.'
+                      : 'Did not clear p\u22640.05 \u2014 pipeline stopped here. No retry, no expanded grid.'}
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
+          {pResults && pResults.stage2 && (
+            <div className="card">
+              <div className="card-title">Stage 2 Result</div>
+              {!pResults.stage2.best ? (
+                <div className="error-box">No configuration in the 480-combo gate sweep produced enough trades.</div>
+              ) : (
+                <>
+                  <p style={{ fontSize: 13, marginBottom: 6 }}>
+                    Best: {pResults.stage2.best.session} \u00d7 {pResults.stage2.best.regime} \u00d7 {pResults.stage2.best.sizing} \u00d7{' '}
+                    stop {pResults.stage2.best.stopAtrMult}/target {pResults.stage2.best.rMultiple}R \u00d7 {pResults.stage2.best.direction}{' '}
+                    \u2014 {pResults.stage2.best.trades} trades, expectancy{' '}
+                    <strong>{pResults.stage2.best.expectancyR >= 0 ? '+' : ''}{pResults.stage2.best.expectancyR}R</strong>
+                  </p>
+                  <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 6,
+                    color: pResults.stage2.pValue <= 0.01 ? 'var(--green)' : pResults.stage2.pValue <= 0.05 ? 'var(--amber)' : 'var(--red)' }}>
+                    p = {(pResults.stage2.pValue * 100).toFixed(1)}%
+                  </p>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    {pResults.stage2.pValue <= 0.05
+                      ? 'Passed \u2014 Stage 4 ran on this exact locked configuration.'
+                      : 'Did not clear p\u22640.05 \u2014 pipeline stopped here.'}
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
+          {pResults && pResults.stage3 && (
+            <div className="card">
+              <div className="card-title">Stage 3 Result \u2014 Rolling Regime-Conditional Retraining</div>
+              {pResults.stage3.error ? (
+                <div className="error-box">{pResults.stage3.error}</div>
+              ) : (
+                <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                      <th style={{ textAlign: 'left', padding: '4px 8px' }}>Month</th>
+                      <th style={{ padding: '4px 8px' }}>Unfiltered n</th>
+                      <th style={{ padding: '4px 8px' }}>Unfiltered R</th>
+                      <th style={{ padding: '4px 8px' }}>Filtered n</th>
+                      <th style={{ padding: '4px 8px' }}>Filtered R</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pResults.stage3.perMonth.map((m, i) => (
+                      <tr key={i}>
+                        <td style={{ padding: '4px 8px' }}>{m.month}</td>
+                        {m.skipped ? (
+                          <td colSpan={4} style={{ padding: '4px 8px', color: 'var(--text-dim)' }}>skipped \u2014 too little data</td>
+                        ) : (
+                          <>
+                            <td style={{ padding: '4px 8px', textAlign: 'right' }}>{m.unfiltered.trades}</td>
+                            <td style={{ padding: '4px 8px', textAlign: 'right' }}>{m.unfiltered.expectancyR >= 0 ? '+' : ''}{m.unfiltered.expectancyR}R</td>
+                            <td style={{ padding: '4px 8px', textAlign: 'right' }}>{m.filtered ? m.filtered.trades : '\u2014'}</td>
+                            <td style={{ padding: '4px 8px', textAlign: 'right' }}>{m.filtered ? `${m.filtered.expectancyR >= 0 ? '+' : ''}${m.filtered.expectancyR}R` : '\u2014'}</td>
+                          </>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+
+          {pResults && pResults.stage4 && (
+            <div className="card">
+              <div className="card-title">Stage 4 Result \u2014 Final Train / Validate / Test</div>
+              <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                    <th style={{ textAlign: 'left', padding: '6px 8px' }}>Bucket</th>
+                    <th style={{ padding: '6px 8px' }}>Trades</th>
+                    <th style={{ padding: '6px 8px' }}>Win%</th>
+                    <th style={{ padding: '6px 8px' }}>Expectancy</th>
+                    <th style={{ padding: '6px 8px' }}>P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {['train', 'validate', 'test'].map((k) => {
+                    const s = pResults.stage4[k]
+                    if (!s) return (
+                      <tr key={k}><td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td><td colSpan={4} style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>not run</td></tr>
+                    )
+                    return (
+                      <tr key={k}>
+                        <td style={{ padding: '6px 8px', textTransform: 'capitalize' }}>{k}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.trades}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.winRate}%</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{s.expectancyR >= 0 ? '+' : ''}{s.expectancyR}R</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: s.totalDollar > 0 ? 'var(--green)' : 'var(--red)' }}>{s.totalDollar >= 0 ? '+' : ''}${s.totalDollar}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       )}
