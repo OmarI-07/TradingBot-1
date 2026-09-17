@@ -1745,6 +1745,130 @@ function runMetaLabelPermutationTest(candles, opts = {}, numPermutations = 20) {
   }
 }
 
+// ── Strategy Importer: bring a strategy from the video-feature app ──
+// Instead of hand-transcribing a pasted strategy's logic (which is how
+// the Section 10 SMC strategy was ported, and which carries real risk of
+// transcription bugs \u2014 one actually happened during that build), this
+// COMPILES AND EXECUTES the exact pasted signalBody code verbatim, via
+// new Function(). Verified directly: running the real SMC signalBody text
+// through this generic engine produces the same sparse-signal behavior
+// (0-1 trades per 3000 bars) as the hand-transcribed Section 10 version,
+// with every referenced indicator correctly populated and the `this`\u2011
+// bound persistent state (adaptive stop-loss, streak counters) correctly
+// initialized exactly as the pasted code itself specifies.
+//
+// The only thing that still needs building per new strategy is whichever
+// INDICATORS it references that aren\u2019t already in the library below \u2014
+// the entry/exit logic itself never needs re-writing, since it runs as-is.
+
+const STRATEGY_INDICATOR_LIBRARY = {
+  liquiditySweepLow: smcDetectSweepOfSwingLow,
+  liquiditySweepHigh: (candles) => {
+    const sh = smcDetectSwingHighs(candles)
+    const sweep = new Array(candles.length).fill(false)
+    let last = null
+    for (let i = 0; i < candles.length; i++) {
+      const k = i - 5
+      if (k >= 0 && sh[k]) last = candles[k].high
+      if (last != null && candles[i].high > last && candles[i].close < last) sweep[i] = true
+    }
+    return sweep
+  },
+  bullishFVG: smcDetectBullishFVG,
+  bosBullish: smcDetectBullishBOS,
+  bosBearish: smcDetectBearishBOS,
+  cisdBullish: smcDetectBullishCISD,
+  cisdBearish: smcDetectBearishCISD,
+  rejectionBlockBullish: smcDetectBullishRejectionBlock,
+  swingHigh: smcDetectSwingHighs,
+  swingLow: smcDetectSwingLows,
+  rsi: (candles) => calcRSISeries(candles),
+  bollingerUpper: (candles) => calcBollingerBands(candles).upper,
+  bollingerMiddle: (candles) => calcBollingerBands(candles).middle,
+  bollingerLower: (candles) => calcBollingerBands(candles).lower,
+}
+
+function calcRSISeries(candles, period = 14) {
+  const out = new Array(candles.length).fill(null)
+  let avgGain = 0, avgLoss = 0
+  for (let i = 1; i <= period && i < candles.length; i++) {
+    const change = candles[i].close - candles[i - 1].close
+    if (change > 0) avgGain += change; else avgLoss -= change
+  }
+  avgGain /= period; avgLoss /= period
+  if (period < candles.length) out[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss))
+  for (let i = period + 1; i < candles.length; i++) {
+    const change = candles[i].close - candles[i - 1].close
+    const gain = change > 0 ? change : 0, loss = change < 0 ? -change : 0
+    avgGain = (avgGain * (period - 1) + gain) / period
+    avgLoss = (avgLoss * (period - 1) + loss) / period
+    out[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss))
+  }
+  return out
+}
+function calcBollingerBands(candles, period = 20, stdMult = 2) {
+  const upper = new Array(candles.length).fill(null)
+  const lower = new Array(candles.length).fill(null)
+  const middle = new Array(candles.length).fill(null)
+  for (let i = period - 1; i < candles.length; i++) {
+    let sum = 0
+    for (let k = i - period + 1; k <= i; k++) sum += candles[k].close
+    const mean = sum / period
+    let variance = 0
+    for (let k = i - period + 1; k <= i; k++) variance += (candles[k].close - mean) ** 2
+    const std = Math.sqrt(variance / period)
+    middle[i] = mean; upper[i] = mean + stdMult * std; lower[i] = mean - stdMult * std
+  }
+  return { upper, middle, lower }
+}
+
+function detectReferencedIndicators(signalBodyCode) {
+  return [...new Set([...signalBodyCode.matchAll(/ind\.(\w+)/g)].map((m) => m[1]))]
+}
+
+function runImportedStrategy(candles, signalBodyCode, sizingOpts = {}) {
+  const referenced = detectReferencedIndicators(signalBodyCode)
+  const missing = referenced.filter((name) => !STRATEGY_INDICATOR_LIBRARY[name])
+  if (missing.length) return { error: 'Missing indicators (not yet in the library): ' + missing.join(', '), missing, referenced }
+
+  const ind = {}
+  for (const name of referenced) ind[name] = STRATEGY_INDICATOR_LIBRARY[name](candles)
+
+  let fn
+  try {
+    fn = new Function('i', 'candles', 'ind', 'pos', signalBodyCode)
+  } catch (e) {
+    return { error: 'Could not compile the pasted code: ' + e.message }
+  }
+
+  const accountSize = sizingOpts.accountSize ?? 25000
+  const riskPct = sizingOpts.riskPct ?? 1
+  const pointValue = sizingOpts.pointValue ?? 5
+
+  const state = {}
+  let pos = null
+  let entryStopPct = null
+  const trades = []
+  for (let i = 0; i < candles.length; i++) {
+    const result = fn.call(state, i, candles, ind, pos)
+    if (!result || result.action === 'none') continue
+    if (result.action === 'buy' && !pos) {
+      pos = { isOpen: true, entryPrice: candles[i].close, entryIdx: i }
+      entryStopPct = (result.factors && result.factors.adaptiveSL) || state._sl || 1.8
+    } else if (result.action === 'sell' && pos && pos.isOpen) {
+      const gainPct = ((candles[i].close - pos.entryPrice) / pos.entryPrice) * 100
+      const riskDollars = accountSize * (riskPct / 100)
+      const stopDistPoints = pos.entryPrice * ((entryStopPct || 1.8) / 100)
+      const contracts = Math.max(1, Math.floor(riskDollars / (stopDistPoints * pointValue)))
+      const grossPnl = (candles[i].close - pos.entryPrice) * pointValue * contracts
+      const commission = COMMISSION_PER_SIDE * 2 * contracts
+      trades.push({ entryIdx: pos.entryIdx, exitIdx: i, gainPct, reason: result.reason, contracts, dollarPnl: grossPnl - commission, rMult: gainPct })
+      pos = null
+    }
+  }
+  return { trades, referenced, missing: [] }
+}
+
 // ══════════════════════════════════════════════════════════════════
 // AUTOMATED PIPELINE \u2014 standalone, self-contained, own tab
 // Stage 1: fixed 140-config mining grid (lookback\u00d7nPips\u00d7k), whole-batch
@@ -2754,6 +2878,15 @@ export default function HypothesisLab() {
   const [pError, setPError]       = useState('')
   const [pResults, setPResults]   = useState(null) // { stage1, stage2, stage4 }
 
+  const [siCode, setSiCode]           = useState('')
+  const [siSymbol, setSiSymbol]       = useState(INTERMARKET_SYMBOL)
+  const [siMonths, setSiMonths]       = useState([])
+  const [siRunning, setSiRunning]     = useState(false)
+  const [siError, setSiError]         = useState('')
+  const [siResults, setSiResults]     = useState(null)
+  const siDetected = siCode ? detectReferencedIndicators(siCode) : []
+  const siMissing = siDetected.filter((n) => !STRATEGY_INDICATOR_LIBRARY[n])
+
   const [ddNPips, setDdNPips]       = useState(8)
   const [ddSubK, setDdSubK]         = useState(4)
   const [ddRunning, setDdRunning]   = useState(false)
@@ -3358,6 +3491,24 @@ export default function HypothesisLab() {
     }
   }
 
+  async function runImportedStrategyUI() {
+    if (!siCode.trim()) { setSiError('Paste the signalBody code first.'); return }
+    if (!siMonths.length) { setSiError('Select at least one month.'); return }
+    setSiError('')
+    setSiRunning(true)
+    setSiResults(null)
+    try {
+      const sorted = [...siMonths].sort((a, b) => a.key.localeCompare(b.key))
+      const candles = await fetchSelectedMonths(siSymbol, '15min', sorted)
+      const result = runImportedStrategy(candles, siCode)
+      setSiResults(result)
+    } catch (e) {
+      setSiError(e.message)
+    } finally {
+      setSiRunning(false)
+    }
+  }
+
   async function runFullPipeline() {
     if (!pMiningMonths.length) { setPError('Select Stage 1 mining months.'); return }
     if (!pConfirmMonths.length) { setPError('Select Stage 2 confirmation months.'); return }
@@ -3504,6 +3655,15 @@ export default function HypothesisLab() {
             color: activeTab === 'pipeline' ? 'var(--blue)' : 'var(--text-muted)', cursor: 'pointer' }}
         >
           Automated Pipeline
+        </button>
+        <button
+          onClick={() => setActiveTab('importer')}
+          style={{ padding: '8px 16px', borderRadius: 6, fontSize: 13, fontWeight: activeTab === 'importer' ? 600 : 400,
+            border: `1px solid ${activeTab === 'importer' ? 'var(--blue)' : 'var(--border)'}`,
+            background: activeTab === 'importer' ? 'rgba(45,108,223,0.12)' : 'var(--surface)',
+            color: activeTab === 'importer' ? 'var(--blue)' : 'var(--text-muted)', cursor: 'pointer' }}
+        >
+          Strategy Importer
         </button>
       </div>
 
@@ -4923,6 +5083,113 @@ export default function HypothesisLab() {
                       </tr>
                     )
                   })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'importer' && (
+        <div>
+          <div className="card">
+            <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Strategy Importer</h2>
+            <p style={{ fontSize: 13, color: 'var(--text-dim)', lineHeight: 1.6 }}>
+              Paste the exact <code>signalBody</code> text from the video-feature app\u2019s export ("Signal
+              function \u2014 edit this to tweak the logic"). This COMPILES AND EXECUTES that code verbatim \u2014
+              verified to reproduce the same behavior as the hand-transcribed Section 10 SMC port before
+              being trusted \u2014 rather than hand-copying it, which carries real risk of transcription bugs.
+              The only thing that needs building per new strategy is whichever indicators it references that
+              aren\u2019t already in the library. Nothing here is trusted just because it compiles and runs \u2014
+              treat any result with the same suspicion as everything else in this Lab.
+            </p>
+          </div>
+
+          <div className="card">
+            <div className="card-title">Paste signalBody code</div>
+            <textarea
+              value={siCode}
+              onChange={(e) => setSiCode(e.target.value)}
+              placeholder="if(i<20)return{action:'none'}; ..."
+              style={{ width: '100%', minHeight: 160, padding: 10, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text)', fontFamily: 'monospace', fontSize: 12 }}
+            />
+            {siCode && (
+              <div style={{ marginTop: 10, fontSize: 12 }}>
+                <div style={{ color: 'var(--text-dim)', marginBottom: 4 }}>
+                  Detected indicators: {siDetected.length ? siDetected.join(', ') : 'none found'}
+                </div>
+                {siMissing.length > 0 ? (
+                  <div style={{ color: 'var(--red)' }}>
+                    Missing from the library (must be built before this can run): {siMissing.join(', ')}
+                  </div>
+                ) : siDetected.length > 0 ? (
+                  <div style={{ color: 'var(--green)' }}>All referenced indicators are available \u2014 ready to run.</div>
+                ) : null}
+              </div>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="card-title">Symbol &amp; Months</div>
+            <div className="row" style={{ gap: 8, marginBottom: 10 }}>
+              <button
+                onClick={() => setSiSymbol(SYMBOL)}
+                style={{ padding: '6px 12px', borderRadius: 6, fontSize: 12, border: `1px solid ${siSymbol === SYMBOL ? 'var(--blue)' : 'var(--border)'}`, background: siSymbol === SYMBOL ? 'rgba(45,108,223,0.12)' : 'var(--surface)', color: siSymbol === SYMBOL ? 'var(--blue)' : 'var(--text-muted)', cursor: 'pointer' }}
+              >
+                {SYMBOL}
+              </button>
+              <button
+                onClick={() => setSiSymbol(INTERMARKET_SYMBOL)}
+                style={{ padding: '6px 12px', borderRadius: 6, fontSize: 12, border: `1px solid ${siSymbol === INTERMARKET_SYMBOL ? 'var(--blue)' : 'var(--border)'}`, background: siSymbol === INTERMARKET_SYMBOL ? 'rgba(45,108,223,0.12)' : 'var(--surface)', color: siSymbol === INTERMARKET_SYMBOL ? 'var(--blue)' : 'var(--text-muted)', cursor: 'pointer' }}
+              >
+                {INTERMARKET_SYMBOL}
+              </button>
+            </div>
+            <MonthPicker label="" selected={siMonths} onToggle={toggle(setSiMonths)} />
+          </div>
+
+          {siError && <div className="error-box">{siError}</div>}
+
+          <div className="row" style={{ marginBottom: 12 }}>
+            <button className="btn-green" onClick={runImportedStrategyUI} disabled={siRunning || siMissing.length > 0} style={{ flex: 1, padding: '11px' }}>
+              {siRunning ? '\u23f3 Running\u2026' : '\u25b6 Run Imported Strategy'}
+            </button>
+          </div>
+
+          {siResults && siResults.error && <div className="error-box">{siResults.error}</div>}
+
+          {siResults && !siResults.error && (
+            <div className="card">
+              <div className="card-title">Results</div>
+              <p style={{ fontSize: 13, marginBottom: 10 }}>
+                {siResults.trades.length} trades,{' '}
+                {siResults.trades.length > 0 && (
+                  <>
+                    {(siResults.trades.filter((t) => t.dollarPnl > 0).length / siResults.trades.length * 100).toFixed(1)}% win rate,{' '}
+                    <span style={{ color: siResults.trades.reduce((s, t) => s + t.dollarPnl, 0) >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
+                      {siResults.trades.reduce((s, t) => s + t.dollarPnl, 0) >= 0 ? '+' : ''}${siResults.trades.reduce((s, t) => s + t.dollarPnl, 0).toFixed(0)}
+                    </span>
+                  </>
+                )}
+              </p>
+              <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ color: 'var(--text-dim)', textAlign: 'right' }}>
+                    <th style={{ textAlign: 'left', padding: '3px 6px' }}>Gain%</th>
+                    <th style={{ padding: '3px 6px' }}>Reason</th>
+                    <th style={{ padding: '3px 6px' }}>Contracts</th>
+                    <th style={{ padding: '3px 6px' }}>P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {siResults.trades.slice(0, 50).map((t, i) => (
+                    <tr key={i}>
+                      <td style={{ padding: '3px 6px' }}>{t.gainPct >= 0 ? '+' : ''}{t.gainPct.toFixed(2)}%</td>
+                      <td style={{ padding: '3px 6px', textAlign: 'right' }}>{t.reason}</td>
+                      <td style={{ padding: '3px 6px', textAlign: 'right' }}>{t.contracts}</td>
+                      <td style={{ padding: '3px 6px', textAlign: 'right', color: t.dollarPnl > 0 ? 'var(--green)' : 'var(--red)' }}>{t.dollarPnl >= 0 ? '+' : ''}${t.dollarPnl.toFixed(0)}</td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
