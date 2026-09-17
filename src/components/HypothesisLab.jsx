@@ -236,223 +236,10 @@ const HYPOTHESES = [
     },
   },
   {
-    id: 'h8_ma_cross_session',
-    name: "H8 \u2014 21-EMA Cross, 7am\u201312pm ET",
-    description: "From an outside source (Reddit, unverified track record) describing a live prop-firm bot: price closes past a moving average on the 5-min chart, traded only 'premarket and a bit after opening bell' through 'flat by 12pm EST', NY/premarket only, never 24/7. Interpreted here as: price crosses (not just sits above/below) a 21-period EMA, gated to 7:00am\u201312:00pm ET (12:00\u201317:00 UTC, fixed EST offset matching this Lab\u0027s existing session convention). The window claim has independent support in this Lab\u0027s own data (session and time-of-day findings elsewhere favoring NY/late-morning); the entry rule itself closely resembles H3a/H5, both of which failed here \u2014 tested fresh, not trusted on the source\u0027s say-so.",
-    makeSignal: (candles) => {
-      const ema = calcEMASeries(candles, 21)
-      return (i) => {
-        if (i < 22) return 'none'
-        const h = utcHour(candles[i].time)
-        if (h < 12 || h >= 17) return 'none'
-        if (ema[i] == null || ema[i - 1] == null) return 'none'
-        const prevClose = candles[i - 1].close, curClose = candles[i].close
-        if (prevClose <= ema[i - 1] && curClose > ema[i]) return 'buy'
-        if (prevClose >= ema[i - 1] && curClose < ema[i]) return 'sell'
-        return 'none'
-      }
-    },
-  },
-  {
-    id: 'h8b_ma_cross_premarket_narrow',
-    name: "H8b \u2014 21-EMA Cross, 7\u201310:30am ET (corrected window)",
-    description: "Corrects a real translation error in H8: the source said entries happen 'premarket and a bit after opening bell,' separately from 'flat by 12pm EST' \u2014 two different claims (when to enter vs. how long to hold), which H8 incorrectly merged into one wide 7am\u201312pm entry window. This narrows entries to 7:00\u201310:30am ET (12:00\u201315:30 UTC, premarket through shortly after the 9:30am open) using the same 21-EMA cross and standard exit logic as H8. Treated as the final disciplined check on this source \u2014 MA period/type were never stated by the source at all and aren\u2019t worth further guessing given this whole category (H3a, H3b, H5) has already failed here.",
-    makeSignal: (candles) => {
-      const ema = calcEMASeries(candles, 21)
-      return (i) => {
-        if (i < 22) return 'none'
-        const h = utcHour(candles[i].time), m = utcMinute(candles[i].time)
-        const afterStart = h >= 12
-        const beforeEnd = h < 15 || (h === 15 && m === 0)
-        if (!(afterStart && beforeEnd)) return 'none'
-        if (ema[i] == null || ema[i - 1] == null) return 'none'
-        const prevClose = candles[i - 1].close, curClose = candles[i].close
-        if (prevClose <= ema[i - 1] && curClose > ema[i]) return 'buy'
-        if (prevClose >= ema[i - 1] && curClose < ema[i]) return 'sell'
-        return 'none'
-      }
-    },
-  },
-  {
-    id: 'h9_sweep_asian_atrfloor',
-    name: "H9 \u2014 PDH/PDL Sweep, Asian Session + ATR Floor",
-    description: "Built directly from the Combination Grid's (Section 7) top result: H2's sweep event, restricted to the Asian session, gated to ATR(14) > 33.33 \u2014 identical logic to what the grid tested, not a re-derivation. The grid's own result had two real concerns: only 13 trades (well under this Lab's usual 25-trade floor) and a p-value of 5.0% resting on a single permutation out of 20, the thinnest possible margin that test can produce. Also worth flagging: Asian session showed up as a standout on H2's own session breakdown once before, at similarly small sample size, and nothing built from that lead survived further testing. Tested fresh, on a wide month range, expecting it may well fail given both the trade count and the pattern-match to a prior false lead.",
-    makeSignal: (candles) => {
-      let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
-      return (i) => {
-        const c = candles[i]
-        const d = dayKey(c.time)
-        if (d !== curDay) {
-          if (curDay !== null) { pdh = curHigh; pdl = curLow }
-          curDay = d; curHigh = c.high; curLow = c.low
-        } else {
-          curHigh = Math.max(curHigh, c.high)
-          curLow  = Math.min(curLow, c.low)
-        }
-        if (pdh == null || pdl == null) return 'none'
-        if (getSession(c.time) !== 'Asian') return 'none'
-        if (calcATR(candles, i) <= 33.33) return 'none'
-        if (c.low  < pdl && c.close > pdl) return 'buy'
-        if (c.high > pdh && c.close < pdh) return 'sell'
-        return 'none'
-      }
-    },
-  },
-  {
-    id: 'h2c_sweep_trend_aligned',
-    name: 'H2c — PDH/PDL Sweep, Trend-Aligned',
-    description: 'Identical event to H2, but only takes the trade when its direction agrees with the prevailing trend at that moment (5-bar % change of 20-SMA): bullish sweep only taken during an uptrend, bearish sweep only taken during a downtrend. Built from the Event Context Explorer\u0027s trend-steepness breakdown on H2\u0027s own event \u2014 steepest-downtrend quintile was significantly negative (CI cleared zero), steepest-uptrend quintile was the only positive mean in that table. Tests the direction-aware version of that finding, not a single arbitrary bucket.',
-    makeSignal: (candles) => {
-      const sma20 = calcSMASeries(candles, 20)
-      let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
-      return (i) => {
-        const c = candles[i]
-        const d = dayKey(c.time)
-        if (d !== curDay) {
-          if (curDay !== null) { pdh = curHigh; pdl = curLow }
-          curDay = d; curHigh = c.high; curLow = c.low
-        } else {
-          curHigh = Math.max(curHigh, c.high)
-          curLow  = Math.min(curLow, c.low)
-        }
-        if (pdh == null || pdl == null) return 'none'
-
-        let trendSteepness = 0
-        if (i >= 5 && sma20[i] != null && sma20[i - 5] != null && sma20[i - 5] !== 0) {
-          trendSteepness = (sma20[i] - sma20[i - 5]) / sma20[i - 5]
-        }
-
-        if (c.low  < pdl && c.close > pdl && trendSteepness > 0) return 'buy'
-        if (c.high > pdh && c.close < pdh && trendSteepness < 0) return 'sell'
-        return 'none'
-      }
-    },
-  },
-  {
-    id: 'h2d_sweep_trend_atr_wick',
-    name: 'H2d — PDH/PDL Sweep, Trend + High ATR + Small Wick',
-    description: "H2c\u2019s trend-alignment gate, now also requiring ATR(14) \u2265 22pts and wick ratio \u2264 0.25 on the event candle \u2014 the exact combination the Event Context Explorer\u2019s joint breakdown showed as the widest split in the whole dataset: Uptrend/High ATR/Small Wick was +0.225R (n=202, CI clears zero positive) while Downtrend/High ATR/Small Wick was -0.360R (n=222, CI clears zero negative), same ATR and wick bucket, only trend direction differing. Thresholds are fixed, round numbers approximating the exploratory median split \u2014 not further tuned to this specific dataset. H2c alone already failed Train; this tests whether the narrower, ATR+wick-qualified version is what H2c\u2019s broader gate was diluting, or whether this is the one good-looking cell out of eight the joint table\u2019s own warning is about.",
-    makeSignal: (candles) => {
-      const sma20 = calcSMASeries(candles, 20)
-      const ATR_THRESHOLD  = 22
-      const WICK_THRESHOLD = 0.25
-      let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
-      return (i) => {
-        const c = candles[i]
-        const d = dayKey(c.time)
-        if (d !== curDay) {
-          if (curDay !== null) { pdh = curHigh; pdl = curLow }
-          curDay = d; curHigh = c.high; curLow = c.low
-        } else {
-          curHigh = Math.max(curHigh, c.high)
-          curLow  = Math.min(curLow, c.low)
-        }
-        if (pdh == null || pdl == null) return 'none'
-
-        let trendSteepness = 0
-        if (i >= 5 && sma20[i] != null && sma20[i - 5] != null && sma20[i - 5] !== 0) {
-          trendSteepness = (sma20[i] - sma20[i - 5]) / sma20[i - 5]
-        }
-        const atr   = calcATR(candles, i)
-        const range = c.high - c.low
-
-        if (c.low < pdl && c.close > pdl) {
-          const lowerWick = Math.min(c.open, c.close) - c.low
-          const wickRatio = range > 0 ? lowerWick / range : 0
-          if (trendSteepness > 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'buy'
-        }
-        if (c.high > pdh && c.close < pdh) {
-          const upperWick = c.high - Math.max(c.open, c.close)
-          const wickRatio = range > 0 ? upperWick / range : 0
-          if (trendSteepness < 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'sell'
-        }
-        return 'none'
-      }
-    },
-  },
-  {
-    id: 'h2e_sweep_trend_atr_wick_ny',
-    name: "H2e \u2014 H2d, New York session only",
-    description: "H2d\u2019s trend + ATR + wick gate, additionally restricted to the New York session (13:00\u201321:00 UTC) \u2014 the one session with a real sample size (48 trades) that looked best in H2d\u0027s Train run (+0.169R). Treated with the same suspicion as every prior session-narrowing attempt in this Lab (H5b, H7b, H3c\u0027s London), all of which looked promising on one Train run and failed on wide walk-forward. Train result here should not be trusted either way \u2014 only walk-forward on a wide month range answers whether this holds up.",
-    makeSignal: (candles) => {
-      const sma20 = calcSMASeries(candles, 20)
-      const ATR_THRESHOLD  = 22
-      const WICK_THRESHOLD = 0.25
-      let curDay = null, curHigh = null, curLow = null, pdh = null, pdl = null
-      return (i) => {
-        const c = candles[i]
-        const d = dayKey(c.time)
-        if (d !== curDay) {
-          if (curDay !== null) { pdh = curHigh; pdl = curLow }
-          curDay = d; curHigh = c.high; curLow = c.low
-        } else {
-          curHigh = Math.max(curHigh, c.high)
-          curLow  = Math.min(curLow, c.low)
-        }
-        if (pdh == null || pdl == null) return 'none'
-        if (getSession(c.time) !== 'New York') return 'none'
-
-        let trendSteepness = 0
-        if (i >= 5 && sma20[i] != null && sma20[i - 5] != null && sma20[i - 5] !== 0) {
-          trendSteepness = (sma20[i] - sma20[i - 5]) / sma20[i - 5]
-        }
-        const atr   = calcATR(candles, i)
-        const range = c.high - c.low
-
-        if (c.low < pdl && c.close > pdl) {
-          const lowerWick = Math.min(c.open, c.close) - c.low
-          const wickRatio = range > 0 ? lowerWick / range : 0
-          if (trendSteepness > 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'buy'
-        }
-        if (c.high > pdh && c.close < pdh) {
-          const upperWick = c.high - Math.max(c.open, c.close)
-          const wickRatio = range > 0 ? upperWick / range : 0
-          if (trendSteepness < 0 && atr >= ATR_THRESHOLD && wickRatio <= WICK_THRESHOLD) return 'sell'
-        }
-        return 'none'
-      }
-    },
-  },
-  {
     id: 'h3a_momentum_any',
     name: 'H3a — Momentum baseline (any time)',
     description: 'Simple 2-bar momentum entry, no time restriction. Baseline to compare H3b against — tests whether session alone changes the result.',
     makeSignal: (candles) => (i) => baselineMomentum(candles, i),
-  },
-  {
-    id: 'h3b_momentum_ny',
-    name: 'H3b — Momentum, NY session only',
-    description: 'Identical rule to H3a, restricted to 13:00–21:00 UTC. If this beats H3a, session timing carries real signal on its own.',
-    makeSignal: (candles) => (i) => {
-      const h = utcHour(candles[i].time)
-      if (h < 13 || h >= 21) return 'none'
-      return baselineMomentum(candles, i)
-    },
-  },
-  {
-    id: 'h3c_momentum_atr_floor',
-    name: 'H3c — Momentum, ATR floor (>33pts)',
-    description: 'Identical entry rule to H3a, gated to only fire when ATR(14) at entry exceeds ~33 points — the exact boundary where this Lab\'s own $500-cap sizing formula switches from 5-6 contracts to 4 or fewer. A bottom-up review of H3a\'s real trade output found the 5-6-contract regime (low ATR) lost $45,765 across 1,124 trades while the 1-4-contract regime (higher ATR) made +$22,130 across 280 trades — not a coincidence, since low ATR IS what forces the sizing formula to the cap. Tests whether that is a genuine volatility-regime effect on the entry itself, not just an artifact of position sizing.',
-    makeSignal: (candles) => (i) => {
-      if (i < 20) return 'none'
-      const atr = calcATR(candles, i)
-      if (atr <= 33.33) return 'none'
-      return baselineMomentum(candles, i)
-    },
-  },
-  {
-    id: 'h4_gap_fade',
-    name: 'H4 — Gap Fade',
-    description: 'First bar of a new day: if open gaps > 1.5\u00d7ATR from prior close, fade back toward it.',
-    makeSignal: (candles) => (i) => {
-      if (i < 20) return 'none'
-      if (dayKey(candles[i].time) === dayKey(candles[i - 1].time)) return 'none'
-      const prevClose = candles[i - 1].close
-      const gap = candles[i].open - prevClose
-      const atr = calcATR(candles, i - 1)
-      if (Math.abs(gap) < atr * 1.5) return 'none'
-      return gap > 0 ? 'sell' : 'buy'
-    },
   },
   {
     id: 'h5_ema_pullback',
@@ -463,26 +250,6 @@ const HYPOTHESES = [
       const ema21 = calcEMASeries(candles, 21)
       const ema50 = calcEMASeries(candles, 50)
       return (i) => {
-        if (ema50[i] == null) return 'none'
-        const bull = ema9[i] > ema21[i] && ema21[i] > ema50[i]
-        const bear = ema9[i] < ema21[i] && ema21[i] < ema50[i]
-        const c = candles[i]
-        if (bull && c.low  <= ema21[i] && c.close > ema21[i]) return 'buy'
-        if (bear && c.high >= ema21[i] && c.close < ema21[i]) return 'sell'
-        return 'none'
-      }
-    },
-  },
-  {
-    id: 'h5b_ema_pullback_offhours',
-    name: 'H5b — EMA Stack Pullback, Offhours only',
-    description: 'Identical entry rule to H5, restricted to the Offhours bucket (04:00–07:00, 12:00–13:00, 21:00–23:00 UTC) — the one session where H5 showed a consistent edge on BOTH Train and walk-forward. Tested as its own hypothesis, not assumed.',
-    makeSignal: (candles) => {
-      const ema9  = calcEMASeries(candles, 9)
-      const ema21 = calcEMASeries(candles, 21)
-      const ema50 = calcEMASeries(candles, 50)
-      return (i) => {
-        if (getSession(candles[i].time) !== 'Offhours') return 'none'
         if (ema50[i] == null) return 'none'
         const bull = ema9[i] > ema21[i] && ema21[i] > ema50[i]
         const bear = ema9[i] < ema21[i] && ema21[i] < ema50[i]
@@ -541,31 +308,6 @@ const HYPOTHESES = [
         if (asianHigh === -Infinity || fired) return 'none'
         const inLondonOrNY = h >= 7 && h < 21
         if (!inLondonOrNY) return 'none'
-        if (c.low  < asianLow  && c.close > asianLow)  { fired = true; return 'buy' }
-        if (c.high > asianHigh && c.close < asianHigh) { fired = true; return 'sell' }
-        return 'none'
-      }
-    },
-  },
-  {
-    id: 'h7b_amd_london_only',
-    name: 'H7b — AMD: Asian Range \u2192 London Sweep, London only',
-    description: 'Identical entry rule to H7, restricted to the London session (07:00\u201312:00 UTC) for the sweep/reversal entry \u2014 the session where H7 showed a consistent edge on BOTH Train and walk-forward. Tested as its own hypothesis, not assumed.',
-    makeSignal: (candles) => {
-      let day = null, asianHigh = -Infinity, asianLow = Infinity, fired = false
-      return (i) => {
-        const c = candles[i]
-        const d = dayKey(c.time)
-        if (d !== day) { day = d; asianHigh = -Infinity; asianLow = Infinity; fired = false }
-        const h = utcHour(c.time)
-        const inAsian = h >= 23 || h < 4
-        if (inAsian) {
-          asianHigh = Math.max(asianHigh, c.high)
-          asianLow  = Math.min(asianLow, c.low)
-          return 'none'
-        }
-        if (asianHigh === -Infinity || fired) return 'none'
-        if (getSession(c.time) !== 'London') return 'none'
         if (c.low  < asianLow  && c.close > asianLow)  { fired = true; return 'buy' }
         if (c.high > asianHigh && c.close < asianHigh) { fired = true; return 'sell' }
         return 'none'
@@ -2445,7 +2187,7 @@ export default function HypothesisLab() {
   const [ptError, setPtError]       = useState('')
   const [ptResults, setPtResults]   = useState(null)
 
-  const [scHypId, setScHypId]       = useState('h8_ma_cross_session')
+  const [scHypId, setScHypId]       = useState('h1_orb')
   const [scMonths, setScMonths]     = useState([])
   const [scRunning, setScRunning]   = useState(false)
   const [scLoadMsg, setScLoadMsg]   = useState('')
